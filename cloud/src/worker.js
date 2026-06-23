@@ -59,7 +59,7 @@ function view(s) {
   const now = Date.now();
   const reminders = (s.reminders || [])
     .filter((r) => now - Number(r.rts || 0) < REMINDER_TTL_MS)
-    .map((r) => ({ id: r.id, title: r.title, start: r.start, link: r.link }));
+    .map((r) => ({ id: r.id, title: r.title, start: r.start, end: r.end || 0, link: r.link }));
   return {
     state: items.length > 0 ? "ALERT" : "OK",
     count: items.length,
@@ -128,6 +128,7 @@ async function checkCalendar(env) {
       id: ev.id,
       title: String(ev.summary || "(no title)").slice(0, 120),
       start,
+      end: ev.end && ev.end.dateTime ? Date.parse(ev.end.dateTime) : 0,
       link: String(ev.hangoutLink || ev.htmlLink || "").slice(0, 300),
       rts: now,
     });
