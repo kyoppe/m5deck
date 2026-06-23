@@ -2,3 +2,5 @@
 include/secrets.h
 tools/venv/
 tools/*.ttf
+cloud/node_modules/
+cloud/.wrangler/

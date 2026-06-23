@@ -1,0 +1,12 @@
+name = "m5deck-alert"
+main = "src/worker.js"
+compatibility_date = "2024-11-01"
+
+# KV 名前空間。`wrangler kv namespace create ALERTS` で作成し、出力された id を貼る。
+[[kv_namespaces]]
+binding = "ALERTS"
+id = "971dd1bbcf944a24bf25ca5459ef4dcb"
+
+# シークレットはコミットしない。以下のコマンドで設定する:
+#   wrangler secret put DD_SECRET       # Datadog <-> Worker 共有シークレット
+#   wrangler secret put DEVICE_TOKEN    # M5 <-> Worker デバイストークン

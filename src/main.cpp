@@ -1,5 +1,8 @@
 #include <M5Unified.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
 #include <time.h>
 
 #include "secrets.h"
@@ -32,6 +35,22 @@ static bool ntpOk = false;
 // ---- パネル切替 ---------------------------------------------------------
 enum Panel { PANEL_DIGITAL = 0, PANEL_ANALOG = 1, PANEL_COUNT = 2 };
 static int currentPanel = PANEL_DIGITAL;
+
+// ---- Datadog アラート ---------------------------------------------------
+static constexpr uint16_t COLOR_RED = lgfx::color565(230, 20, 20);
+static String alertServerState = "OK";  // "ALERT" / "OK"
+static String alertMonitor = "";
+static String alertPriority = "";
+static String alertLink = "";   // Datadog イベントへのディープリンク（$LINK）
+static long alertSeq = 0;       // サーバの発報シーケンス
+static long alertAckedSeq = 0;  // 確認済みシーケンス（ローカル + サーバ ackSeq の大きい方）
+static uint32_t alertLastPoll = 0;
+static bool hubDismissed = false;  // 調査ハブ画面を閉じたか
+
+// サイレン鳴動中か（未確認の ALERT がある）
+static inline bool sirenActive() {
+  return alertServerState == "ALERT" && alertSeq > alertAckedSeq;
+}
 
 // ---- 時刻ソース ---------------------------------------------------------
 static void systemTimeFromRtc() {
@@ -268,6 +287,210 @@ static void renderAnalog(const struct tm &tm) {
   canvas.pushSprite(0, 0);
 }
 
+// ---- アラート通信 -------------------------------------------------------
+static void pollAlert() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  WiFiClientSecure client;
+  client.setInsecure();  // 簡易: 証明書検証なし
+  HTTPClient https;
+  String url = String(ALERT_WORKER_URL) + "/status";
+  if (!https.begin(client, url)) return;
+  https.addHeader("Authorization", String("Bearer ") + ALERT_DEVICE_TOKEN);
+  https.setTimeout(8000);
+  int code = https.GET();
+  if (code == 200) {
+    JsonDocument doc;
+    if (deserializeJson(doc, https.getString()) == DeserializationError::Ok) {
+      alertServerState = String((const char *)(doc["state"] | "OK"));
+      alertMonitor = String((const char *)(doc["monitor"] | ""));
+      alertPriority = String((const char *)(doc["priority"] | ""));
+      alertLink = String((const char *)(doc["link"] | ""));
+      alertSeq = doc["seq"] | 0L;
+      long serverAck = doc["ackSeq"] | 0L;
+      if (serverAck > alertAckedSeq) alertAckedSeq = serverAck;
+    }
+  } else {
+    Serial.printf("pollAlert HTTP %d\n", code);
+  }
+  https.end();
+}
+
+static void ackAlert() {
+  alertAckedSeq = alertSeq;  // まずローカルで即ミュート
+  if (WiFi.status() != WL_CONNECTED) return;
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient https;
+  String url = String(ALERT_WORKER_URL) + "/ack";
+  if (!https.begin(client, url)) return;
+  https.addHeader("Authorization", String("Bearer ") + ALERT_DEVICE_TOKEN);
+  https.addHeader("Content-Type", "application/json");
+  https.setTimeout(8000);
+  String body = String("{\"seq\":") + alertSeq + "}";
+  int code = https.POST(body);
+  Serial.printf("ackAlert seq=%ld HTTP %d\n", alertSeq, code);
+  https.end();
+}
+
+// サイレン音：2音を交互に鳴らす（呼び出すたびに継続更新）
+static void sirenSound() {
+  static uint32_t last = 0;
+  static bool hi = false;
+  uint32_t ms = millis();
+  if (ms - last >= 350) {
+    last = ms;
+    hi = !hi;
+    M5.Speaker.tone(hi ? 990 : 660, 400);
+  }
+}
+
+// 中心から伸びる光のビーム（くさび形）を1本描く
+static void drawBeam(int cx, int cy, float angDeg, float halfDeg, int len, uint16_t color) {
+  const float a1 = (angDeg - halfDeg) * DEG_TO_RAD;
+  const float a2 = (angDeg + halfDeg) * DEG_TO_RAD;
+  const int x1 = cx + cosf(a1) * len;
+  const int y1 = cy + sinf(a1) * len;
+  const int x2 = cx + cosf(a2) * len;
+  const int y2 = cy + sinf(a2) * len;
+  canvas.fillTriangle(cx, cy, x1, y1, x2, y2, color);
+}
+
+// 0..1 の係数で 2 色を線形補間
+static uint16_t lerpRGB(uint8_t r0, uint8_t g0, uint8_t b0,
+                        uint8_t r1, uint8_t g1, uint8_t b1, float t) {
+  if (t < 0) t = 0;
+  if (t > 1) t = 1;
+  return lgfx::color565((uint8_t)(r0 + (r1 - r0) * t),
+                        (uint8_t)(g0 + (g1 - g0) * t),
+                        (uint8_t)(b0 + (b1 - b0) * t));
+}
+
+// 回転灯（パトランプ）を「横から見た」サイレン画面。
+// 黒い土台＋赤いドーム＋内部で左右に回る発光体＋ドームから左右へ振れる光ビーム。
+static void renderAlert() {
+  const int W = canvas.width();
+  const int H = canvas.height();
+  const uint32_t ms = millis();
+
+  // 回転角（1周 ≈ 1.05 秒）
+  const float th = ms * 0.006f;
+  const float s = sinf(th);  // -1(右) .. +1(左) 内部発光体の横位置
+  const float c = cosf(th);  // +1 で正面向き → ドーム全体が明るく光る
+  const float face = c * 0.5f + 0.5f;          // 0..1 正面度
+  const float leftI = s > 0 ? s : 0;           // 左へ抜ける光の強さ
+  const float rightI = s < 0 ? -s : 0;         // 右へ抜ける光の強さ
+
+  canvas.fillScreen(lgfx::color565(12, 0, 0));
+
+  const int cx = W / 2;
+
+  // ドーム頂点付近を起点に、左右上方へ振れる光ビーム（部屋を照らす光）
+  const int apexX = cx;
+  const int apexY = 74;
+  if (leftI > 0.03f)
+    drawBeam(apexX, apexY, 236, 17, 340,
+             lerpRGB(12, 0, 0, 255, 120, 30, leftI));
+  if (rightI > 0.03f)
+    drawBeam(apexX, apexY, 304, 17, 340,
+             lerpRGB(12, 0, 0, 255, 120, 30, rightI));
+
+  // 赤いドーム（円筒の胴 ＋ 上半円のキャップ）。正面向きで明るく発光。
+  const int rw = 52;
+  const int bodyTop = 100;
+  const int bodyBot = 184;
+  const uint16_t domeC = lerpRGB(120, 12, 12, 235, 45, 30, face);
+  canvas.fillRect(cx - rw, bodyTop, rw * 2, bodyBot - bodyTop, domeC);
+  canvas.fillEllipse(cx, bodyTop, rw, 46, domeC);
+
+  // ガラスの縦リブ（暗い縦線）でレンズらしさ
+  for (int i = -2; i <= 2; i++) {
+    const int lx = cx + i * 21;
+    canvas.drawFastVLine(lx, bodyTop - 10, bodyBot - bodyTop + 10,
+                         lerpRGB(70, 6, 6, 150, 25, 18, face));
+  }
+
+  // 内部の発光体（左右に回りながら移動）。外オレンジ → 内白。
+  const int hx = cx + (int)(s * 26.0f);
+  const int hy = 138;
+  canvas.fillCircle(hx, hy, 26, lerpRGB(170, 35, 8, 255, 150, 50, face));
+  canvas.fillCircle(hx, hy, 16, lgfx::color565(255, 225, 150));
+  canvas.fillCircle(hx, hy, 8, TFT_WHITE);
+
+  // ドーム左上のハイライト（ガラスの艶）
+  canvas.fillEllipse(cx - 26, bodyTop - 6, 8, 16, lgfx::color565(255, 170, 160));
+
+  // 黒い土台
+  canvas.fillRoundRect(cx - 60, bodyBot - 2, 120, 30, 7, lgfx::color565(20, 20, 22));
+  canvas.fillRoundRect(cx - 60, bodyBot - 2, 120, 6, 3, lgfx::color565(48, 48, 52));
+
+  // テキスト（最前面）
+  canvas.setTextDatum(middle_center);
+  canvas.setFont(&fonts::FreeSansBold24pt7b);
+  canvas.setTextColor(TFT_WHITE);
+  canvas.drawString("ALERT", cx, 24);
+
+  canvas.setFont(&fonts::Font2);
+  canvas.setTextColor(TFT_WHITE);
+  canvas.drawString("TAP TO ACKNOWLEDGE", cx, H - 12);
+
+  canvas.pushSprite(0, 0);
+}
+
+// ACK 後の「調査ハブ」画面：モニター名＋QR（Datadog ディープリンク）
+static void renderHub() {
+  const int W = canvas.width();
+  const int H = canvas.height();
+  canvas.fillScreen(COLOR_BG);
+
+  // 上部：優先度バッジ＋モニター名
+  canvas.setTextDatum(top_left);
+  if (alertPriority.length()) {
+    uint16_t pc = COLOR_RED;
+    if (alertPriority == "P3" || alertPriority == "P4" || alertPriority == "P5")
+      pc = lgfx::color565(220, 160, 0);
+    canvas.fillRoundRect(8, 8, 48, 24, 5, pc);
+    canvas.setTextColor(COLOR_BG, pc);
+    canvas.setFont(&fonts::Font2);
+    canvas.setTextDatum(middle_center);
+    canvas.drawString(alertPriority.c_str(), 8 + 24, 8 + 12);
+  }
+  canvas.setTextDatum(top_left);
+  canvas.setTextColor(COLOR_WHITE, COLOR_BG);
+  canvas.setFont(&fonts::Font2);
+  // モニター名（W に収まる範囲で 2 行まで雑に折り返し）
+  canvas.setTextWrap(true);
+  canvas.setCursor(64, 12);
+  canvas.print(alertMonitor.length() ? alertMonitor : String("Datadog monitor"));
+  canvas.setTextWrap(false);
+
+  // QR（右寄せ）。version=1 指定で内部が自動拡張する
+  const int qr = 150;
+  const int qx = W - qr - 12;
+  const int qy = H - qr - 10;
+  if (alertLink.length()) {
+    canvas.qrcode(alertLink.c_str(), qx, qy, qr, 1, true);
+  } else {
+    canvas.setTextColor(COLOR_WHITE, COLOR_BG);
+    canvas.setTextDatum(middle_center);
+    canvas.setFont(&fonts::Font2);
+    canvas.drawString("(no link)", qx + qr / 2, qy + qr / 2);
+  }
+
+  // 左側：誘導文
+  canvas.setTextDatum(top_left);
+  canvas.setTextColor(lgfx::color565(120, 220, 255), COLOR_BG);
+  canvas.setFont(&fonts::Font2);
+  canvas.drawString("SCAN ->", 16, 70);
+  canvas.setTextColor(COLOR_WHITE, COLOR_BG);
+  canvas.drawString("Datadog", 16, 92);
+  canvas.drawString("app", 16, 112);
+
+  canvas.setTextColor(lgfx::color565(150, 150, 150), COLOR_BG);
+  canvas.drawString("tap: back", 16, H - 26);
+
+  canvas.pushSprite(0, 0);
+}
+
 void setup() {
   auto cfg = M5.config();
   M5.begin(cfg);
@@ -283,8 +506,13 @@ void setup() {
   canvas.setPsram(true);
   canvas.createSprite(M5.Display.width(), M5.Display.height());
 
+  M5.Speaker.setVolume(180);
+
   computeLayout();
   syncTime();
+
+  pollAlert();  // 起動直後に一度確認
+  alertLastPoll = millis();
 }
 
 void loop() {
@@ -297,14 +525,64 @@ void loop() {
 
   const uint32_t ms = millis();
 
-  // 画面タップでパネルを切り替え
+  // 5秒ごとに Worker をポーリング（アラート状態を取得）
+  if (ms - alertLastPoll >= 5000) {
+    alertLastPoll = ms;
+    pollAlert();
+    forceDraw = true;  // 状態変化後の再描画
+  }
+
+  // 新しい発報 or 復旧でハブの「閉じた」状態をリセット
+  static long prevSeq = 0;
+  if (alertSeq != prevSeq) {
+    prevSeq = alertSeq;
+    hubDismissed = false;
+  }
+  if (alertServerState != "ALERT") hubDismissed = false;
+
+  // タップ検出
+  bool tapped = false;
   if (M5.Touch.getCount() > 0) {
     auto t = M5.Touch.getDetail();
-    if (t.wasPressed()) {
-      currentPanel = (currentPanel + 1) % PANEL_COUNT;
+    if (t.wasPressed()) tapped = true;
+  }
+
+  // ---- アラート層 ① サイレン（未確認の ALERT）：時計より優先 ----
+  if (sirenActive()) {
+    if (tapped) {
+      ackAlert();           // 確認 → 即ミュート → 調査ハブへ
+      M5.Speaker.stop();
+      tapped = false;       // このタップはハブ閉じ/切替に使わない
       forceDraw = true;
-      Serial.printf("panel -> %d\n", currentPanel);
+    } else {
+      sirenSound();
+      renderAlert();
+      delay(10);
+      return;
     }
+  }
+
+  // サイレンでなければスピーカーは止めておく
+  M5.Speaker.stop();
+
+  // ---- アラート層 ② 調査ハブ（確認済みだが ALERT 継続中）----
+  if (alertServerState == "ALERT" && !hubDismissed) {
+    if (tapped) {
+      hubDismissed = true;  // ハブを閉じて時計へ
+      tapped = false;
+      forceDraw = true;
+    } else {
+      if (forceDraw) renderHub();
+      delay(10);
+      return;
+    }
+  }
+
+  // 画面タップでパネルを切り替え（サイレン解除/ハブ閉じタップは切替に使わない）
+  if (tapped) {
+    currentPanel = (currentPanel + 1) % PANEL_COUNT;
+    forceDraw = true;
+    Serial.printf("panel -> %d\n", currentPanel);
   }
 
   time_t now = time(nullptr);

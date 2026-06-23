@@ -1,0 +1,13 @@
+{
+  "name": "m5deck-alert",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Datadog alert relay for m5deck (Cloudflare Worker + KV)",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^3.90.0"
+  }
+}
