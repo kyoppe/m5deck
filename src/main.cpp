@@ -8,6 +8,7 @@
 #include "secrets.h"
 #include "MujiNum.h"  // 無印 駅の時計用の数字フォント(Jost*)
 #include "Seg7.h"     // デジタル時計用 7セグフォント(DSEG7 Classic Bold)
+#include "AngryVoice.h"  // 持ち上げ時の怒りボイス(WAV, Kyoko)
 
 // ---- 見た目の設定 -------------------------------------------------------
 static constexpr uint16_t COLOR_BG = TFT_BLACK;
@@ -824,6 +825,51 @@ static void renderReminder() {
   canvas.pushSprite(0, 0);
 }
 
+// 「持ち上げたら怒る」用：揺れる怒り顔＋セリフ。
+static void renderAngry(uint32_t ms) {
+  const int W = canvas.width();
+  const int H = canvas.height();
+  // プルプル揺れ
+  const int sx = (int)(sinf(ms * 0.06f) * 5);
+  const int sy = (int)(cosf(ms * 0.05f) * 4);
+
+  canvas.fillScreen(lgfx::color565(150, 0, 0));
+
+  const int cx = W / 2 + sx;
+  const int cy = H / 2 - 20 + sy;
+
+  // 目（白目＋黒目）
+  const int eyeDx = 60, eyeY = cy - 6, eyeR = 26;
+  canvas.fillCircle(cx - eyeDx, eyeY, eyeR, TFT_WHITE);
+  canvas.fillCircle(cx + eyeDx, eyeY, eyeR, TFT_WHITE);
+  canvas.fillCircle(cx - eyeDx + 4, eyeY + 4, 11, TFT_BLACK);
+  canvas.fillCircle(cx + eyeDx - 4, eyeY + 4, 11, TFT_BLACK);
+
+  // 怒り眉（内側が下がる太い斜め線）
+  for (int i = -3; i <= 3; i++) {
+    canvas.drawLine(cx - eyeDx - 26, eyeY - 34 + i, cx - eyeDx + 22, eyeY - 14 + i,
+                    lgfx::color565(20, 0, 0));
+    canvas.drawLine(cx + eyeDx + 26, eyeY - 34 + i, cx + eyeDx - 22, eyeY - 14 + i,
+                    lgfx::color565(20, 0, 0));
+  }
+
+  // 口（への字・開き）
+  canvas.fillTriangle(cx - 46, cy + 60, cx + 46, cy + 60, cx, cy + 30,
+                      lgfx::color565(20, 0, 0));
+
+  // セリフ
+  canvas.setTextDatum(top_center);
+  canvas.setTextColor(TFT_WHITE, lgfx::color565(150, 0, 0));
+  canvas.setFont(&fonts::lgfxJapanGothicP_20);
+  canvas.setTextSize(1.0f);
+  canvas.drawString("なにしてくれちゃってんだよ", W / 2, 6);
+  canvas.setFont(&fonts::lgfxJapanGothicP_24);
+  canvas.drawString("置けよ〜", W / 2, H - 30);
+
+  drawMuteOverlay();
+  canvas.pushSprite(0, 0);
+}
+
 void setup() {
   auto cfg = M5.config();
   M5.begin(cfg);
@@ -840,6 +886,11 @@ void setup() {
   canvas.createSprite(M5.Display.width(), M5.Display.height());
 
   M5.Speaker.setVolume(180);
+
+  if (!M5.Imu.isEnabled()) {
+    if (M5.Imu.begin()) Serial.println("IMU enabled");
+    else Serial.println("IMU not found");
+  }
 
   computeLayout();
   syncTime();
@@ -926,8 +977,12 @@ void loop() {
     }
   }
 
-  // サイレンでなければスピーカーは止めておく
-  M5.Speaker.stop();
+  // サイレンが「鳴動→終了」した瞬間だけ停止する。
+  // （毎ループ無条件に stop すると、怒りボイス等の単発再生を即切ってしまう）
+  static bool sirenWas = false;
+  const bool sirenNow = sirenActive();
+  if (sirenWas && !sirenNow) M5.Speaker.stop();
+  sirenWas = sirenNow;
 
   // ---- アラート層 ② 調査ハブ（確認済みだが ALERT 継続中）----
   // CLEAR ボタン内タップ＝表示中の1件を消す。それ以外のタップ＝次のQRへ（最後で時計へ）。
@@ -1011,6 +1066,47 @@ void loop() {
         return;
       }
     }
+  }
+
+  // ---- 「持ち上げたら怒る」層（アラート/通知が無いときだけ）----
+  static bool angryActive = false;
+  static uint32_t angryStart = 0;
+  static uint32_t lastAngry = 0;
+  static uint32_t lastVib = 0;
+  static bool vibOn = false;
+  constexpr uint32_t ANGRY_MS = 5000;        // 怒り顔の表示時間（振動も同じ間ずっと）
+  constexpr uint32_t ANGRY_COOLDOWN = 5000;  // 連続で怒らないように
+
+  if (!angryActive && !activeNow && remSeqNow <= remAckedSeq &&
+      ms - lastAngry > ANGRY_COOLDOWN) {
+    float ax, ay, az;
+    if (M5.Imu.getAccel(&ax, &ay, &az)) {
+      const float mag = sqrtf(ax * ax + ay * ay + az * az);
+      if (fabsf(mag - 1.0f) > 0.45f) {  // 静止(約1g)から大きくズレ＝持ち上げ/移動
+        angryActive = true;
+        angryStart = ms;
+        if (!gMuted) M5.Speaker.playWav(angryWav, angryWavLen);
+        M5.Power.setVibration(255);
+        vibOn = true;
+        lastVib = ms;
+      }
+    }
+  }
+  if (angryActive) {
+    if (ms - lastVib > 170) {  // 表示中はずっとプルプル振動
+      lastVib = ms;
+      vibOn = !vibOn;
+      M5.Power.setVibration(vibOn ? 255 : 0);
+    }
+    renderAngry(ms);
+    if (ms - angryStart >= ANGRY_MS) {
+      angryActive = false;
+      M5.Power.setVibration(0);
+      lastAngry = ms;
+      forceDraw = true;
+    }
+    delay(10);
+    return;
   }
 
   // 画面タップでパネルを切り替え（アラート無し時のみ）
