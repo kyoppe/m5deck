@@ -435,8 +435,8 @@ static void pollAlert() {
       if (rems.size() > 0) {
         JsonObject r = rems[rems.size() - 1];
         remTitle = String((const char *)(r["title"] | ""));
-        remStart = (long)(r["start"] | 0LL) / 1000;  // ms -> 秒
-        remEnd = (long)(r["end"] | 0LL) / 1000;
+        remStart = (long)((r["start"] | 0LL) / 1000LL);  // ms -> 秒（64bitで割ってから縮める）
+        remEnd = (long)((r["end"] | 0LL) / 1000LL);
       }
       if (alertMux) xSemaphoreGive(alertMux);
       // スカラはそのまま反映
@@ -814,7 +814,7 @@ static void renderReminder() {
   if (start > 0) {
     long mins = (start - time(nullptr) + 59) / 60;
     if (mins < 0) mins = 0;
-    char in[24];
+    char in[48];
     snprintf(in, sizeof(in), "まもなく開始 (あと%ld分)", mins);
     canvas.drawString(in, W / 2, H - 24);
   }
