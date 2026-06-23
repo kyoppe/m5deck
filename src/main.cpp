@@ -207,22 +207,29 @@ static void drawAlertBadge() {
 }
 
 // 右上のバッテリー残量（ボタンBでトグル表示）。アイコン＋%、充電中は稲妻。
+// パネルのテイストに合わせて配色を切替（デジタル=ダーク調/緑黄赤、アナログ=白地に黒のミニマル）。
 static void drawBatteryOverlay() {
   if (!showBattery) return;
   int level = M5.Power.getBatteryLevel();  // 0-100
   if (level < 0) level = 0;
   if (level > 100) level = 100;
   const bool charging = M5.Power.isCharging();
+  const bool analog = (currentPanel == PANEL_ANALOG);
 
-  const uint16_t col = (level >= 50)  ? COLOR_GREEN
-                       : (level >= 20) ? TFT_YELLOW
-                                       : lgfx::color565(230, 40, 40);
-  const uint16_t pbg = lgfx::color565(18, 18, 18);
+  // 配色：アナログは白地に黒（低下時のみ赤）、デジタルはダーク調＋残量カラー
+  const uint16_t col =
+      analog ? ((level < 20) ? lgfx::color565(200, 30, 30) : COLOR_BLACK)
+             : ((level >= 50)  ? COLOR_GREEN
+                : (level >= 20) ? TFT_YELLOW
+                                : lgfx::color565(230, 40, 40));
+  const uint16_t pbg = analog ? COLOR_WHITE : lgfx::color565(18, 18, 18);
+  const uint16_t boltCol = analog ? lgfx::color565(200, 30, 30) : TFT_WHITE;
 
   const int padW = 92, padH = 26;
   const int px = canvas.width() - padW - 6;
   const int py = 6;
-  canvas.fillRoundRect(px, py, padW, padH, 6, pbg);
+  // アナログは白地そのままに溶け込ませる（ピル背景は描かない）
+  if (!analog) canvas.fillRoundRect(px, py, padW, padH, 6, pbg);
 
   // バッテリー外枠＋端子
   const int bw = 30, bh = 14;
@@ -238,8 +245,8 @@ static void drawBatteryOverlay() {
   // 充電中の稲妻マーク
   if (charging) {
     const int zx = bx + bw / 2, zy = by + bh / 2;
-    canvas.fillTriangle(zx - 1, by + 2, zx + 4, zy, zx, zy, TFT_WHITE);
-    canvas.fillTriangle(zx, zy, zx - 4, zy, zx + 1, by + bh - 2, TFT_WHITE);
+    canvas.fillTriangle(zx - 1, by + 2, zx + 4, zy, zx, zy, boltCol);
+    canvas.fillTriangle(zx, zy, zx - 4, zy, zx + 1, by + bh - 2, boltCol);
   }
 
   // %テキスト
@@ -1128,7 +1135,7 @@ void loop() {
     float ax, ay, az;
     if (M5.Imu.getAccel(&ax, &ay, &az)) {
       const float mag = sqrtf(ax * ax + ay * ay + az * az);
-      if (fabsf(mag - 1.0f) > 0.22f) {  // 静止(約1g)から少しズレ＝持ち上げ/移動（繊細め）
+      if (fabsf(mag - 1.0f) > 0.30f) {  // 静止(約1g)からのズレ＝持ち上げ/移動
         angryActive = true;
         angryStart = ms;
         if (!gMuted) M5.Speaker.playWav(angryWav, angryWavLen);
