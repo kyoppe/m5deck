@@ -857,15 +857,6 @@ static void renderAngry(uint32_t ms) {
   canvas.fillTriangle(cx - 46, cy + 60, cx + 46, cy + 60, cx, cy + 30,
                       lgfx::color565(20, 0, 0));
 
-  // セリフ
-  canvas.setTextDatum(top_center);
-  canvas.setTextColor(TFT_WHITE, lgfx::color565(150, 0, 0));
-  canvas.setFont(&fonts::lgfxJapanGothicP_20);
-  canvas.setTextSize(1.0f);
-  canvas.drawString("なにしてくれちゃってんだよ", W / 2, 6);
-  canvas.setFont(&fonts::lgfxJapanGothicP_24);
-  canvas.drawString("置けよ〜", W / 2, H - 30);
-
   drawMuteOverlay();
   canvas.pushSprite(0, 0);
 }
@@ -885,7 +876,7 @@ void setup() {
   canvas.setPsram(true);
   canvas.createSprite(M5.Display.width(), M5.Display.height());
 
-  M5.Speaker.setVolume(180);
+  M5.Speaker.setVolume(220);
 
   if (!M5.Imu.isEnabled()) {
     if (M5.Imu.begin()) Serial.println("IMU enabled");
