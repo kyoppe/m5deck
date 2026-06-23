@@ -53,6 +53,17 @@ static SemaphoreHandle_t alertMux = nullptr;
 static bool hubDismissed = false;             // 調査ハブ画面を閉じたか
 static int hubIndex = 0;                       // ハブで表示中のアラート番号
 
+// ---- ミュート（サイレン/チャイムの音をまとめて消す。視覚は残す）--------
+static bool gMuted = false;
+
+// ---- Google カレンダー通知（穏やかな先約リマインド）---------------------
+static constexpr uint16_t COLOR_CAL = lgfx::color565(40, 120, 230);  // 落ち着いた青
+static volatile long remSeq = 0;       // サーバのリマインドシーケンス
+static volatile long remAckedSeq = 0;  // 確認済みリマインド
+static volatile long remStart = 0;     // 直近リマインドの開始時刻(epoch秒)
+static String remTitle;                // mutex 保護: 予定名
+static String remLink;                 // mutex 保護: 会議リンク等
+
 // ハブ画面の「CLEAR」ボタン領域（画面座標）。この中をタップ＝表示中の1件を消す。
 static constexpr int CLR_X = 16;
 static constexpr int CLR_Y = 192;
@@ -186,6 +197,17 @@ static void drawAlertBadge() {
   canvas.drawString(buf, x + w / 2, y + h / 2);
 }
 
+// ミュート中だけ、左上に薄いスピーカー消音アイコンを重ねる（全画面共通）。
+static void drawMuteOverlay() {
+  if (!gMuted) return;
+  const int x = 22, y = 6;
+  const uint16_t col = lgfx::color565(120, 120, 120);
+  canvas.fillRect(x, y + 5, 4, 6, col);                       // スピーカー胴
+  canvas.fillTriangle(x + 4, y + 8, x + 11, y + 1, x + 11, y + 15, col);  // コーン
+  canvas.drawLine(x - 1, y + 1, x + 13, y + 15, col);         // 斜線（消音）
+  canvas.drawLine(x, y + 1, x + 14, y + 15, col);
+}
+
 // ---- デジタル時計パネル -------------------------------------------------
 static void renderDigital(const struct tm &tm, bool colonOn) {
   canvas.fillScreen(COLOR_BG);
@@ -225,6 +247,7 @@ static void renderDigital(const struct tm &tm, bool colonOn) {
   canvas.fillCircle(8, 10, 4, dot);
 
   drawAlertBadge();
+  drawMuteOverlay();
   canvas.pushSprite(0, 0);
 }
 
@@ -319,6 +342,7 @@ static void renderAnalog(const struct tm &tm) {
   canvas.fillCircle(cx, cy, 7, COLOR_BLACK);
 
   drawAlertBadge();
+  drawMuteOverlay();
   canvas.pushSprite(0, 0);
 }
 
@@ -351,11 +375,22 @@ static void pollAlert() {
         n++;
       }
       alertCount = n;
+      // カレンダー通知：配列の末尾＝最新の予定を採用
+      JsonArray rems = doc["reminders"].as<JsonArray>();
+      if (rems.size() > 0) {
+        JsonObject r = rems[rems.size() - 1];
+        remTitle = String((const char *)(r["title"] | ""));
+        remLink = String((const char *)(r["link"] | ""));
+        remStart = (long)(r["start"] | 0LL) / 1000;  // ms -> 秒
+      }
       if (alertMux) xSemaphoreGive(alertMux);
       // スカラはそのまま反映
       alertSeq = seq;
       if (serverAck > alertAckedSeq) alertAckedSeq = serverAck;
       gAlertActive = (n > 0);
+      remSeq = doc["remSeq"] | 0L;
+      const long serverRemAck = doc["remAckSeq"] | 0L;
+      if (serverRemAck > remAckedSeq) remAckedSeq = serverRemAck;
     }
   } else {
     Serial.printf("pollAlert HTTP %d\n", code);
@@ -386,6 +421,25 @@ static void ackAlert() {
   String body = String("{\"seq\":") + seq + "}";
   int code = https.POST(body);
   Serial.printf("ackAlert seq=%ld HTTP %d\n", seq, code);
+  https.end();
+}
+
+// カレンダー通知を確認済みにする（Worker /ack に remSeq を送る）。
+static void ackReminder() {
+  const long seq = remSeq;
+  remAckedSeq = seq;  // まずローカルで即消音/非表示
+  if (WiFi.status() != WL_CONNECTED) return;
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient https;
+  String url = String(ALERT_WORKER_URL) + "/ack";
+  if (!https.begin(client, url)) return;
+  https.addHeader("Authorization", String("Bearer ") + ALERT_DEVICE_TOKEN);
+  https.addHeader("Content-Type", "application/json");
+  https.setTimeout(8000);
+  String body = String("{\"remSeq\":") + seq + "}";
+  int code = https.POST(body);
+  Serial.printf("ackReminder remSeq=%ld HTTP %d\n", seq, code);
   https.end();
 }
 
@@ -523,8 +577,9 @@ static void renderAlert() {
 
   canvas.setFont(&fonts::Font2);
   canvas.setTextColor(TFT_WHITE);
-  canvas.drawString("TAP TO ACKNOWLEDGE", cx, H - 12);
+  canvas.drawString(gMuted ? "TAP TO ACK (MUTED)" : "TAP TO ACKNOWLEDGE", cx, H - 12);
 
+  drawMuteOverlay();
   canvas.pushSprite(0, 0);
 }
 
@@ -614,6 +669,90 @@ static void renderHub() {
   canvas.setFont(&fonts::Font2);
   canvas.drawString("CLEAR", CLR_X + CLR_W / 2, CLR_Y + CLR_H / 2);
 
+  drawMuteOverlay();
+  canvas.pushSprite(0, 0);
+}
+
+// 穏やかなチャイム（上行する2音）。ミュート中は鳴らさない。
+static void calmChime() {
+  if (gMuted) return;
+  M5.Speaker.tone(880, 160);
+  delay(170);
+  M5.Speaker.tone(1175, 220);
+  delay(60);
+  M5.Speaker.stop();
+}
+
+// カレンダー通知画面：落ち着いた青＋予定名＋開始時刻＋「あとN分」＋（あれば）QR。
+static void renderReminder() {
+  const int W = canvas.width();
+  const int H = canvas.height();
+
+  String title, link;
+  long start;
+  if (alertMux) xSemaphoreTake(alertMux, portMAX_DELAY);
+  title = remTitle;
+  link = remLink;
+  start = remStart;
+  if (alertMux) xSemaphoreGive(alertMux);
+
+  canvas.fillScreen(COLOR_CAL);
+
+  // ヘッダ
+  canvas.setTextDatum(top_left);
+  canvas.setTextColor(lgfx::color565(200, 225, 255), COLOR_CAL);
+  canvas.setFont(&fonts::Font2);
+  canvas.drawString("UPCOMING", 14, 12);
+
+  // 開始時刻 HH:MM（大きめ）
+  char hhmm[8] = "--:--";
+  if (start > 0) {
+    time_t t = (time_t)start;
+    struct tm lt;
+    localtime_r(&t, &lt);
+    snprintf(hhmm, sizeof(hhmm), "%02d:%02d", lt.tm_hour, lt.tm_min);
+  }
+  canvas.setTextDatum(top_left);
+  canvas.setTextColor(TFT_WHITE, COLOR_CAL);
+  canvas.setFont(&fonts::FreeSansBold24pt7b);
+  canvas.drawString(hhmm, 14, 34);
+
+  // あと何分
+  if (start > 0) {
+    long mins = (start - time(nullptr) + 59) / 60;  // 切り上げ
+    if (mins < 0) mins = 0;
+    char in[20];
+    snprintf(in, sizeof(in), "in %ld min", mins);
+    canvas.setFont(&fonts::Font2);
+    canvas.setTextColor(lgfx::color565(210, 230, 255), COLOR_CAL);
+    canvas.drawString(in, 150, 58);
+  }
+
+  // 予定名（2 行まで折り返し）
+  canvas.setTextColor(TFT_WHITE, COLOR_CAL);
+  canvas.setFont(&fonts::Font4);
+  canvas.setTextWrap(true);
+  canvas.setCursor(14, 96);
+  canvas.print(title.length() ? title : String("(no title)"));
+  canvas.setTextWrap(false);
+
+  // 会議リンクがあれば QR（右下）
+  if (link.length()) {
+    const int qr = 96;
+    canvas.qrcode(link.c_str(), W - qr - 12, H - qr - 28, qr, 1, true);
+    canvas.setTextDatum(bottom_right);
+    canvas.setTextColor(lgfx::color565(210, 230, 255), COLOR_CAL);
+    canvas.setFont(&fonts::Font2);
+    canvas.drawString("scan to join", W - 12, H - 6);
+  }
+
+  // 操作ヒント
+  canvas.setTextDatum(bottom_left);
+  canvas.setTextColor(lgfx::color565(210, 230, 255), COLOR_CAL);
+  canvas.setFont(&fonts::Font2);
+  canvas.drawString("tap to dismiss", 14, H - 6);
+
+  drawMuteOverlay();
   canvas.pushSprite(0, 0);
 }
 
@@ -668,6 +807,14 @@ void loop() {
     forceDraw = true;
   }
 
+  // 物理 C ボタン（右下）でミュートON/OFF。音だけ消し、視覚は残す。
+  if (M5.BtnC.wasPressed()) {
+    gMuted = !gMuted;
+    if (gMuted) M5.Speaker.stop();
+    forceDraw = true;
+    Serial.printf("mute -> %d\n", gMuted ? 1 : 0);
+  }
+
   // タップ検出（座標も保持）
   bool tapped = false;
   int tapX = 0, tapY = 0;
@@ -681,14 +828,29 @@ void loop() {
   }
 
   // ---- アラート層 ① サイレン（未確認の ALERT）：時計より優先 ----
+  // 5分鳴り続けたら不在とみなして自動ACK（消音して時計＋バッジへ）。
+  static uint32_t sirenStartMs = 0;
+  static long sirenStartSeq = -1;
+  constexpr uint32_t SIREN_TIMEOUT_MS = 5UL * 60UL * 1000UL;
   if (sirenActive()) {
+    if (sirenStartSeq != seqNow) {  // 新しい発報でタイマーをリセット
+      sirenStartSeq = seqNow;
+      sirenStartMs = ms;
+    }
     if (tapped) {
       ackAlert();           // 確認 → 即ミュート → 調査ハブへ
       M5.Speaker.stop();
       tapped = false;       // このタップはハブ閉じ/切替に使わない
       forceDraw = true;
+    } else if (ms - sirenStartMs >= SIREN_TIMEOUT_MS) {
+      ackAlert();           // 5分無応答 → 自動ACK（不在とみなす）
+      M5.Speaker.stop();
+      hubDismissed = true;  // 調査ハブは開かず時計＋バッジへ
+      forceDraw = true;
+      Serial.println("auto-ACK: siren timed out (absent)");
     } else {
-      sirenSound();
+      if (!gMuted) sirenSound();
+      else M5.Speaker.stop();
       renderAlert();
       delay(10);
       return;
@@ -739,6 +901,47 @@ void loop() {
     forceDraw = true;
     delay(10);
     return;
+  }
+
+  // ---- カレンダー通知層（穏やか）：Datadog アラートが無いときだけ表示 ----
+  static long chimedRemSeq = -1;
+  static bool remDismissed = false;
+  static uint32_t remShownMs = 0;
+  static long prevRemSeq = 0;
+  const long remSeqNow = remSeq;
+  if (remSeqNow != prevRemSeq) {  // 新しい通知でリセット
+    prevRemSeq = remSeqNow;
+    remDismissed = false;
+  }
+  const bool remPending = (remSeqNow > remAckedSeq) && !activeNow;
+  if (remPending && !remDismissed) {
+    if (remStart > 0 && time(nullptr) > remStart + 120) {
+      ackReminder();              // 開始2分超過は黙って確認済み（遅延表示防止）
+    } else {
+      if (chimedRemSeq != remSeqNow) {  // 初回だけ穏やかなチャイム
+        chimedRemSeq = remSeqNow;
+        remShownMs = ms;
+        calmChime();
+        forceDraw = true;
+      }
+      if (tapped) {
+        ackReminder();
+        remDismissed = true;
+        tapped = false;
+        forceDraw = true;
+      } else if (ms - remShownMs >= 60000UL) {  // 60秒で自動的に閉じる
+        ackReminder();
+        remDismissed = true;
+        forceDraw = true;
+      } else {
+        if (forceDraw || ms - lastDraw >= 1000) {
+          lastDraw = ms;
+          renderReminder();
+        }
+        delay(10);
+        return;
+      }
+    }
   }
 
   // 画面タップでパネルを切り替え（アラート無し時のみ）

@@ -37,9 +37,12 @@ function bearer(req) {
 
 async function load(env) {
   const raw = await env.ALERTS.get(KEY);
-  if (raw) return JSON.parse(raw);
-  return { seq: 0, ackSeq: 0, items: {} };
+  const base = { seq: 0, ackSeq: 0, items: {}, remSeq: 0, remAckSeq: 0, reminders: [], notified: {} };
+  if (raw) return Object.assign(base, JSON.parse(raw));
+  return base;
 }
+
+const REMINDER_TTL_MS = 30 * 60 * 1000;  // カレンダー通知の表示寿命（30分）
 
 async function save(env, s) {
   await env.ALERTS.put(KEY, JSON.stringify(s));
@@ -52,16 +55,99 @@ function view(s) {
   const ids = Object.keys(s.items);
   ids.sort((a, b) => String(s.items[a].ts || "").localeCompare(String(s.items[b].ts || "")));
   const items = ids.map((id) => ({ id, ...s.items[id] }));
+  // カレンダー通知（古いものは除外）
+  const now = Date.now();
+  const reminders = (s.reminders || [])
+    .filter((r) => now - Number(r.rts || 0) < REMINDER_TTL_MS)
+    .map((r) => ({ id: r.id, title: r.title, start: r.start, link: r.link }));
   return {
     state: items.length > 0 ? "ALERT" : "OK",
     count: items.length,
     seq: s.seq,
     ackSeq: s.ackSeq,
     items,
+    remSeq: s.remSeq || 0,
+    remAckSeq: s.remAckSeq || 0,
+    reminders,
   };
 }
 
+// ---- Google Calendar（Cron で先読みして 5 分前通知を作る）-----------------
+async function googleAccessToken(env) {
+  const r = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      client_id: env.GCAL_CLIENT_ID,
+      client_secret: env.GCAL_CLIENT_SECRET,
+      refresh_token: env.GCAL_REFRESH_TOKEN,
+      grant_type: "refresh_token",
+    }),
+  });
+  if (!r.ok) return null;
+  const j = await r.json();
+  return j.access_token || null;
+}
+
+const LEAD_MS = 5 * 60 * 1000;  // 開始何分前に通知するか（5分）
+
+async function checkCalendar(env) {
+  if (!env.GCAL_REFRESH_TOKEN || !env.GCAL_CLIENT_ID || !env.GCAL_CLIENT_SECRET) return;
+  const token = await googleAccessToken(env);
+  if (!token) return;
+
+  const now = Date.now();
+  const timeMin = new Date(now).toISOString();
+  const timeMax = new Date(now + LEAD_MS + 60 * 1000).toISOString();  // 少し先まで
+  const cal = env.GCAL_CALENDAR_ID || "primary";
+  const u = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(cal)}/events`
+    + `?singleEvents=true&orderBy=startTime&maxResults=10`
+    + `&timeMin=${encodeURIComponent(timeMin)}&timeMax=${encodeURIComponent(timeMax)}`;
+  const r = await fetch(u, { headers: { authorization: `Bearer ${token}` } });
+  if (!r.ok) return;
+  const data = await r.json();
+  const events = data.items || [];
+
+  const s = await load(env);
+  let changed = false;
+  for (const ev of events) {
+    if (ev.status === "cancelled") continue;
+    // 「自分が作成した」または「自分がYes（承諾）した」予定のみ
+    const mine = ev.creator && ev.creator.self;
+    const accepted = Array.isArray(ev.attendees)
+      && ev.attendees.some((a) => a.self && a.responseStatus === "accepted");
+    if (!mine && !accepted) continue;
+    if (!ev.start || !ev.start.dateTime) continue;           // 終日予定は対象外
+    const start = Date.parse(ev.start.dateTime);
+    const lead = start - now;
+    if (lead < 0 || lead > LEAD_MS) continue;                // 開始まで 0〜5 分
+    const key = `${ev.id}@${start}`;
+    if (s.notified[key]) continue;                           // 既に通知済み
+
+    s.reminders.push({
+      id: ev.id,
+      title: String(ev.summary || "(no title)").slice(0, 120),
+      start,
+      link: String(ev.hangoutLink || ev.htmlLink || "").slice(0, 300),
+      rts: now,
+    });
+    if (s.reminders.length > 10) s.reminders = s.reminders.slice(-10);
+    s.remSeq = (s.remSeq || 0) + 1;
+    s.notified[key] = now;
+    changed = true;
+  }
+  // notified の掃除（2時間より古い）
+  for (const k of Object.keys(s.notified)) {
+    if (now - s.notified[k] > 2 * 60 * 60 * 1000) delete s.notified[k];
+  }
+  if (changed) await save(env, s);
+}
+
 export default {
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(checkCalendar(env));
+  },
+
   async fetch(req, env) {
     const url = new URL(req.url);
     const path = url.pathname;
@@ -137,9 +223,11 @@ export default {
       let body = {};
       try { body = await req.json(); } catch (_) {}
       const s = await load(env);
-      s.ackSeq = Number(body.seq != null ? body.seq : (s.seq || 0));
+      if (body.seq != null) s.ackSeq = Number(body.seq);
+      if (body.remSeq != null) s.remAckSeq = Number(body.remSeq);
+      if (body.seq == null && body.remSeq == null) s.ackSeq = s.seq || 0;
       await save(env, s);
-      return json({ ok: true, ackSeq: s.ackSeq });
+      return json({ ok: true, ackSeq: s.ackSeq, remAckSeq: s.remAckSeq });
     }
 
     // デバイスからの手動クリア（アラート単位。id 無しは全消し）

@@ -7,6 +7,15 @@ compatibility_date = "2024-11-01"
 binding = "ALERTS"
 id = "971dd1bbcf944a24bf25ca5459ef4dcb"
 
+# Cron: 毎分 Google カレンダーを先読みして 5 分前通知を作る。
+[triggers]
+crons = ["* * * * *"]
+
 # シークレットはコミットしない。以下のコマンドで設定する:
-#   wrangler secret put DD_SECRET       # Datadog <-> Worker 共有シークレット
-#   wrangler secret put DEVICE_TOKEN    # M5 <-> Worker デバイストークン
+#   wrangler secret put DD_SECRET            # Datadog <-> Worker 共有シークレット
+#   wrangler secret put DEVICE_TOKEN         # M5 <-> Worker デバイストークン
+#   wrangler secret put GCAL_CLIENT_ID       # Google OAuth クライアントID
+#   wrangler secret put GCAL_CLIENT_SECRET   # Google OAuth クライアントシークレット
+#   wrangler secret put GCAL_REFRESH_TOKEN   # Google OAuth リフレッシュトークン
+# 任意:
+#   wrangler secret put GCAL_CALENDAR_ID     # 対象カレンダーID（既定 primary）
