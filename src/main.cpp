@@ -43,6 +43,7 @@ static bool ntpOk = false;
 // ---- パネル切替 ---------------------------------------------------------
 enum Panel { PANEL_DIGITAL = 0, PANEL_ANALOG = 1, PANEL_COUNT = 2 };
 static int currentPanel = PANEL_DIGITAL;
+static bool showBattery = false;  // ボタンBでトグル：右上にバッテリー残量を表示
 
 // ---- Datadog アラート ---------------------------------------------------
 // ポーリングは別タスク(core0)で実行し、メインループ(core1)を止めない。
@@ -205,6 +206,51 @@ static void drawAlertBadge() {
   canvas.drawString(buf, x + w / 2, y + h / 2);
 }
 
+// 右上のバッテリー残量（ボタンBでトグル表示）。アイコン＋%、充電中は稲妻。
+static void drawBatteryOverlay() {
+  if (!showBattery) return;
+  int level = M5.Power.getBatteryLevel();  // 0-100
+  if (level < 0) level = 0;
+  if (level > 100) level = 100;
+  const bool charging = M5.Power.isCharging();
+
+  const uint16_t col = (level >= 50)  ? COLOR_GREEN
+                       : (level >= 20) ? TFT_YELLOW
+                                       : lgfx::color565(230, 40, 40);
+  const uint16_t pbg = lgfx::color565(18, 18, 18);
+
+  const int padW = 92, padH = 26;
+  const int px = canvas.width() - padW - 6;
+  const int py = 6;
+  canvas.fillRoundRect(px, py, padW, padH, 6, pbg);
+
+  // バッテリー外枠＋端子
+  const int bw = 30, bh = 14;
+  const int bx = px + 8, by = py + (padH - bh) / 2;
+  canvas.drawRoundRect(bx, by, bw, bh, 2, col);
+  canvas.fillRect(bx + bw, by + 4, 3, bh - 8, col);
+
+  // 残量バー
+  const int innerW = bw - 4;
+  const int fillW = innerW * level / 100;
+  if (fillW > 0) canvas.fillRect(bx + 2, by + 2, fillW, bh - 4, col);
+
+  // 充電中の稲妻マーク
+  if (charging) {
+    const int zx = bx + bw / 2, zy = by + bh / 2;
+    canvas.fillTriangle(zx - 1, by + 2, zx + 4, zy, zx, zy, TFT_WHITE);
+    canvas.fillTriangle(zx, zy, zx - 4, zy, zx + 1, by + bh - 2, TFT_WHITE);
+  }
+
+  // %テキスト
+  char buf[8];
+  snprintf(buf, sizeof(buf), "%d%%", level);
+  canvas.setFont(&fonts::Font2);
+  canvas.setTextDatum(middle_left);
+  canvas.setTextColor(col, pbg);
+  canvas.drawString(buf, bx + bw + 8, py + padH / 2);
+}
+
 // ミュートアイコン（スピーカー＋音波＋斜線）を小スプライトに不透明で1度だけ描く。
 // 背景キーは黒(0)。アイコンは明るいグレーで描く。
 static void buildMuteSprite() {
@@ -302,6 +348,7 @@ static void renderDigital(const struct tm &tm, bool colonOn) {
   uint16_t dot = ntpOk ? COLOR_GREEN : (wifiOk ? TFT_YELLOW : COLOR_DIM);
   canvas.fillCircle(8, 10, 4, dot);
 
+  drawBatteryOverlay();
   drawAlertBadge();
   drawMuteOverlay();
   canvas.pushSprite(0, 0);
@@ -397,6 +444,7 @@ static void renderAnalog(const struct tm &tm) {
   // 中心のハブ
   canvas.fillCircle(cx, cy, 7, COLOR_BLACK);
 
+  drawBatteryOverlay();
   drawAlertBadge();
   drawMuteOverlay();
   canvas.pushSprite(0, 0);
@@ -923,6 +971,13 @@ void loop() {
     if (gMuted) M5.Speaker.stop();
     forceDraw = true;
     Serial.printf("mute -> %d\n", gMuted ? 1 : 0);
+  }
+
+  // 物理 B ボタン（中央）でバッテリー残量表示をトグル。
+  if (M5.BtnB.wasPressed()) {
+    showBattery = !showBattery;
+    forceDraw = true;
+    Serial.printf("battery overlay -> %d\n", showBattery ? 1 : 0);
   }
 
   // タップ検出（座標も保持）
