@@ -1,2 +1,4 @@
 .pio
 include/secrets.h
+tools/venv/
+tools/*.ttf
