@@ -67,38 +67,56 @@ curl -X POST "$URL/resolve" -H "Authorization: Bearer $DD_SECRET"
 
 ## Datadog 側の設定
 
-### Webhook を2つ作成
+### Webhook を1本だけ作成（`/event`）
 
-Integrations → Webhooks（または Integration tile "Webhooks"）で2件追加。
+発報か復旧かは Worker がペイロードの `transition`/`type` を見て自動判定するので、
+Webhook は1本で済む（条件分岐も不要）。
 
-1. 名前 `m5deck-alert`
-   - URL: `https://m5deck-alert.<subdomain>.workers.dev/alert`
-   - Custom Headers: `{"Authorization": "Bearer <DD_SECRET>"}`
-   - Payload:
-     ```json
-     {
-       "monitor": "$ALERT_TITLE",
-       "id": "$ALERT_ID",
-       "priority": "$PRIORITY",
-       "message": "$TEXT_ONLY_MSG",
-       "link": "$LINK",
-       "ts": "$DATE"
-     }
-     ```
-2. 名前 `m5deck-recovery`
-   - URL: `.../resolve`
-   - Custom Headers: 同上
-   - Payload: `{"ts":"$DATE"}`
+Integrations → Webhooks → **+ New**
 
-※ Custom Headers が使えない場合は URL を `/alert?k=<DD_SECRET>` のようにクエリで渡してもよい。
+- 名前: `m5deck`
+- URL: `https://m5deck-alert.<subdomain>.workers.dev/event`
+- 「Show optional」→ Custom Headers:
+  ```json
+  {"Authorization": "Bearer <DD_SECRET>"}
+  ```
+- Payload（"Encode as form" はオフ）:
+  ```json
+  {
+    "id": "$ALERT_ID",
+    "monitor": "$ALERT_TITLE",
+    "priority": "$PRIORITY",
+    "message": "$TEXT_ONLY_MSG",
+    "link": "$LINK",
+    "transition": "$ALERT_TRANSITION",
+    "type": "$EVENT_TYPE",
+    "ts": "$DATE"
+  }
+  ```
+
+判定ルール: `transition`/`type` に `recover` を含めば復旧（その `id` を解除）、
+それ以外（Triggered / Re-Triggered / Warn / No Data）は発報として扱う。
+
+※ Custom Headers が使えない場合は URL を `/event?k=<DD_SECRET>` のようにクエリで渡してもよい。
 
 ### モニターのメッセージに @ ハンドラを記載
 
-サイレンを鳴らしたいモニターの通知メッセージに以下を追記:
+サイレンを鳴らしたいモニターの通知メッセージに以下を1行追記するだけ:
 
 ```
-{{#is_alert}}@webhook-m5deck-alert{{/is_alert}}
-{{#is_recovery}}@webhook-m5deck-recovery{{/is_recovery}}
+@webhook-m5deck
 ```
 
-これで、対象モニターが Alert になったら M5 がサイレン、Recovery で通常表示に戻る。
+対象モニターが Alert/Warn になったら M5 がサイレン、Recovery で通常表示に戻る。
+
+### QR コード（モバイル）について
+
+`/status` が返す各アラートの `link` は `https://<org>.datadoghq.com/monitors/<$ALERT_ID>`
+というモニターページURLに組み立て直している（`$ALERT_ID` はモニターID）。
+これは Datadog モバイルアプリが Universal Link として開くため、`$LINK`（イベントリンク）
+よりアプリ起動が安定する。org ドメインは `$LINK` のホストから取得（リージョン差を自動吸収）。
+
+### テスト
+
+モニター編集画面右上の **Test Notifications** → **Alert** 送信でサイレン、
+**Recovered** 送信で時計に戻る（実データ不要で Webhook を叩ける）。

@@ -37,19 +37,24 @@ enum Panel { PANEL_DIGITAL = 0, PANEL_ANALOG = 1, PANEL_COUNT = 2 };
 static int currentPanel = PANEL_DIGITAL;
 
 // ---- Datadog アラート ---------------------------------------------------
+// ポーリングは別タスク(core0)で実行し、メインループ(core1)を止めない。
+// ホットパスはスカラ値(volatile)で読み、表示用の String だけ mutex で保護する。
 static constexpr uint16_t COLOR_RED = lgfx::color565(230, 20, 20);
-static String alertServerState = "OK";  // "ALERT" / "OK"
-static String alertMonitor = "";
-static String alertPriority = "";
-static String alertLink = "";   // Datadog イベントへのディープリンク（$LINK）
-static long alertSeq = 0;       // サーバの発報シーケンス
-static long alertAckedSeq = 0;  // 確認済みシーケンス（ローカル + サーバ ackSeq の大きい方）
-static uint32_t alertLastPoll = 0;
-static bool hubDismissed = false;  // 調査ハブ画面を閉じたか
+static constexpr int MAX_ALERTS = 6;          // 同時保持するアラートの上限
+static volatile bool gAlertActive = false;    // サーバが ALERT 状態か
+static volatile long alertSeq = 0;            // サーバの発報シーケンス
+static volatile long alertAckedSeq = 0;       // 確認済みシーケンス
+static volatile int alertCount = 0;           // 現在のアラート件数
+static String alMon[MAX_ALERTS];              // mutex 保護: モニター名
+static String alPri[MAX_ALERTS];              // mutex 保護: 優先度
+static String alLink[MAX_ALERTS];             // mutex 保護: Datadog $LINK
+static SemaphoreHandle_t alertMux = nullptr;
+static bool hubDismissed = false;             // 調査ハブ画面を閉じたか
+static int hubIndex = 0;                       // ハブで表示中のアラート番号
 
 // サイレン鳴動中か（未確認の ALERT がある）
 static inline bool sirenActive() {
-  return alertServerState == "ALERT" && alertSeq > alertAckedSeq;
+  return gAlertActive && alertSeq > alertAckedSeq;
 }
 
 // ---- 時刻ソース ---------------------------------------------------------
@@ -153,6 +158,27 @@ static void computeLayout() {
   colonDy = (int)(digitH * 0.20f);    // 中心からの上下オフセット
 }
 
+// 未解決アラートがあるとき、時計の右上に点滅する赤いバッジを重ねる。
+// タップでハブ（QR）に戻れることを示す痕跡。
+static void drawAlertBadge() {
+  if (!gAlertActive) return;
+  const int n = alertCount;
+  char buf[20];
+  if (n > 1) snprintf(buf, sizeof(buf), "! ALERT %d", n);
+  else snprintf(buf, sizeof(buf), "! ALERT");
+  const int w = (n > 1) ? 100 : 78;
+  const int h = 22;
+  const int x = canvas.width() - w - 6;
+  const int y = 6;
+  const bool on = ((millis() / 500) % 2) == 0;
+  const uint16_t bg = on ? lgfx::color565(230, 20, 20) : lgfx::color565(90, 0, 0);
+  canvas.fillRoundRect(x, y, w, h, 5, bg);
+  canvas.setTextDatum(middle_center);
+  canvas.setTextColor(TFT_WHITE, bg);
+  canvas.setFont(&fonts::Font2);
+  canvas.drawString(buf, x + w / 2, y + h / 2);
+}
+
 // ---- デジタル時計パネル -------------------------------------------------
 static void renderDigital(const struct tm &tm, bool colonOn) {
   canvas.fillScreen(COLOR_BG);
@@ -191,6 +217,7 @@ static void renderDigital(const struct tm &tm, bool colonOn) {
   uint16_t dot = ntpOk ? COLOR_GREEN : (wifiOk ? TFT_YELLOW : COLOR_DIM);
   canvas.fillCircle(8, 10, 4, dot);
 
+  drawAlertBadge();
   canvas.pushSprite(0, 0);
 }
 
@@ -284,6 +311,7 @@ static void renderAnalog(const struct tm &tm) {
   // 中心のハブ
   canvas.fillCircle(cx, cy, 7, COLOR_BLACK);
 
+  drawAlertBadge();
   canvas.pushSprite(0, 0);
 }
 
@@ -301,13 +329,25 @@ static void pollAlert() {
   if (code == 200) {
     JsonDocument doc;
     if (deserializeJson(doc, https.getString()) == DeserializationError::Ok) {
-      alertServerState = String((const char *)(doc["state"] | "OK"));
-      alertMonitor = String((const char *)(doc["monitor"] | ""));
-      alertPriority = String((const char *)(doc["priority"] | ""));
-      alertLink = String((const char *)(doc["link"] | ""));
-      alertSeq = doc["seq"] | 0L;
-      long serverAck = doc["ackSeq"] | 0L;
+      const long seq = doc["seq"] | 0L;
+      const long serverAck = doc["ackSeq"] | 0L;
+      JsonArray items = doc["items"].as<JsonArray>();
+      // 表示用 String は mutex 保護下で更新
+      if (alertMux) xSemaphoreTake(alertMux, portMAX_DELAY);
+      int n = 0;
+      for (JsonObject it : items) {
+        if (n >= MAX_ALERTS) break;
+        alMon[n] = String((const char *)(it["monitor"] | ""));
+        alPri[n] = String((const char *)(it["priority"] | ""));
+        alLink[n] = String((const char *)(it["link"] | ""));
+        n++;
+      }
+      alertCount = n;
+      if (alertMux) xSemaphoreGive(alertMux);
+      // スカラはそのまま反映
+      alertSeq = seq;
       if (serverAck > alertAckedSeq) alertAckedSeq = serverAck;
+      gAlertActive = (n > 0);
     }
   } else {
     Serial.printf("pollAlert HTTP %d\n", code);
@@ -315,8 +355,17 @@ static void pollAlert() {
   https.end();
 }
 
+// ポーリング専用タスク（core0）。メインループ(core1)を一切ブロックしない。
+static void alertTask(void *pv) {
+  for (;;) {
+    pollAlert();
+    vTaskDelay(pdMS_TO_TICKS(5000));
+  }
+}
+
 static void ackAlert() {
-  alertAckedSeq = alertSeq;  // まずローカルで即ミュート
+  const long seq = alertSeq;
+  alertAckedSeq = seq;  // まずローカルで即ミュート
   if (WiFi.status() != WL_CONNECTED) return;
   WiFiClientSecure client;
   client.setInsecure();
@@ -326,9 +375,9 @@ static void ackAlert() {
   https.addHeader("Authorization", String("Bearer ") + ALERT_DEVICE_TOKEN);
   https.addHeader("Content-Type", "application/json");
   https.setTimeout(8000);
-  String body = String("{\"seq\":") + alertSeq + "}";
+  String body = String("{\"seq\":") + seq + "}";
   int code = https.POST(body);
-  Serial.printf("ackAlert seq=%ld HTTP %d\n", alertSeq, code);
+  Serial.printf("ackAlert seq=%ld HTTP %d\n", seq, code);
   https.end();
 }
 
@@ -440,35 +489,61 @@ static void renderAlert() {
 static void renderHub() {
   const int W = canvas.width();
   const int H = canvas.height();
+
+  // ポーリングタスクと競合しないよう、表示中アラートをスナップショット
+  String monitor, priority, link;
+  int count, idx;
+  if (alertMux) xSemaphoreTake(alertMux, portMAX_DELAY);
+  count = alertCount;
+  if (hubIndex >= count) hubIndex = 0;
+  idx = hubIndex;
+  if (count > 0) {
+    monitor = alMon[idx];
+    priority = alPri[idx];
+    link = alLink[idx];
+  }
+  if (alertMux) xSemaphoreGive(alertMux);
+
   canvas.fillScreen(COLOR_BG);
 
   // 上部：優先度バッジ＋モニター名
   canvas.setTextDatum(top_left);
-  if (alertPriority.length()) {
+  if (priority.length()) {
     uint16_t pc = COLOR_RED;
-    if (alertPriority == "P3" || alertPriority == "P4" || alertPriority == "P5")
+    if (priority == "P3" || priority == "P4" || priority == "P5")
       pc = lgfx::color565(220, 160, 0);
     canvas.fillRoundRect(8, 8, 48, 24, 5, pc);
     canvas.setTextColor(COLOR_BG, pc);
     canvas.setFont(&fonts::Font2);
     canvas.setTextDatum(middle_center);
-    canvas.drawString(alertPriority.c_str(), 8 + 24, 8 + 12);
+    canvas.drawString(priority.c_str(), 8 + 24, 8 + 12);
   }
+
+  // 件数インジケータ（複数あるとき「2/3」）
+  if (count > 1) {
+    char ind[12];
+    snprintf(ind, sizeof(ind), "%d/%d", idx + 1, count);
+    canvas.setTextDatum(top_right);
+    canvas.setTextColor(lgfx::color565(255, 120, 120), COLOR_BG);
+    canvas.setFont(&fonts::Font2);
+    canvas.drawString(ind, W - 12, 40);
+  }
+
   canvas.setTextDatum(top_left);
   canvas.setTextColor(COLOR_WHITE, COLOR_BG);
   canvas.setFont(&fonts::Font2);
   // モニター名（W に収まる範囲で 2 行まで雑に折り返し）
   canvas.setTextWrap(true);
   canvas.setCursor(64, 12);
-  canvas.print(alertMonitor.length() ? alertMonitor : String("Datadog monitor"));
+  canvas.print(monitor.length() ? monitor : String("Datadog monitor"));
   canvas.setTextWrap(false);
 
   // QR（右寄せ）。version=1 指定で内部が自動拡張する
   const int qr = 150;
   const int qx = W - qr - 12;
   const int qy = H - qr - 10;
-  if (alertLink.length()) {
-    canvas.qrcode(alertLink.c_str(), qx, qy, qr, 1, true);
+  if (link.length()) {
+    canvas.qrcode(link.c_str(), qx, qy, qr, 1, true);
   } else {
     canvas.setTextColor(COLOR_WHITE, COLOR_BG);
     canvas.setTextDatum(middle_center);
@@ -485,8 +560,9 @@ static void renderHub() {
   canvas.drawString("Datadog", 16, 92);
   canvas.drawString("app", 16, 112);
 
+  // フッタの操作ヒント
   canvas.setTextColor(lgfx::color565(150, 150, 150), COLOR_BG);
-  canvas.drawString("tap: back", 16, H - 26);
+  canvas.drawString(count > 1 ? "tap: next / back" : "tap: back", 16, H - 26);
 
   canvas.pushSprite(0, 0);
 }
@@ -511,8 +587,9 @@ void setup() {
   computeLayout();
   syncTime();
 
-  pollAlert();  // 起動直後に一度確認
-  alertLastPoll = millis();
+  // ポーリングは別タスク(core0)で常時実行。メインループ(core1)は止めない。
+  alertMux = xSemaphoreCreateMutex();
+  xTaskCreatePinnedToCore(alertTask, "alert", 16384, nullptr, 1, nullptr, 0);
 }
 
 void loop() {
@@ -525,20 +602,21 @@ void loop() {
 
   const uint32_t ms = millis();
 
-  // 5秒ごとに Worker をポーリング（アラート状態を取得）
-  if (ms - alertLastPoll >= 5000) {
-    alertLastPoll = ms;
-    pollAlert();
-    forceDraw = true;  // 状態変化後の再描画
-  }
-
-  // 新しい発報 or 復旧でハブの「閉じた」状態をリセット
+  // 新しい発報 or 復旧でハブの「閉じた」状態をリセット（状態はタスクが更新）
   static long prevSeq = 0;
-  if (alertSeq != prevSeq) {
-    prevSeq = alertSeq;
+  static bool prevActive = false;
+  const long seqNow = alertSeq;
+  const bool activeNow = gAlertActive;
+  if (seqNow != prevSeq) {
+    prevSeq = seqNow;
     hubDismissed = false;
+    hubIndex = 0;
   }
-  if (alertServerState != "ALERT") hubDismissed = false;
+  if (!activeNow) hubDismissed = false;
+  if (activeNow != prevActive) {  // 状態が変わったら即再描画
+    prevActive = activeNow;
+    forceDraw = true;
+  }
 
   // タップ検出
   bool tapped = false;
@@ -566,19 +644,35 @@ void loop() {
   M5.Speaker.stop();
 
   // ---- アラート層 ② 調査ハブ（確認済みだが ALERT 継続中）----
-  if (alertServerState == "ALERT" && !hubDismissed) {
+  // タップで次のアラートのQRへ。最後まで送ったら時計へ戻る。
+  if (activeNow && !hubDismissed) {
     if (tapped) {
-      hubDismissed = true;  // ハブを閉じて時計へ
       tapped = false;
+      hubIndex++;
+      if (hubIndex >= alertCount) {  // 最後の次 → 閉じる
+        hubDismissed = true;
+        hubIndex = 0;
+      }
       forceDraw = true;
-    } else {
+    }
+    if (!hubDismissed) {
       if (forceDraw) renderHub();
       delay(10);
       return;
     }
   }
 
-  // 画面タップでパネルを切り替え（サイレン解除/ハブ閉じタップは切替に使わない）
+  // ハブを閉じた後でも ALERT 継続中なら、タップでハブ（QR）へ戻れる
+  if (tapped && activeNow) {
+    hubDismissed = false;
+    hubIndex = 0;
+    tapped = false;
+    forceDraw = true;
+    delay(10);
+    return;
+  }
+
+  // 画面タップでパネルを切り替え（アラート無し時のみ）
   if (tapped) {
     currentPanel = (currentPanel + 1) % PANEL_COUNT;
     forceDraw = true;
@@ -597,7 +691,9 @@ void loop() {
       renderDigital(tm, colonOn);
     }
   } else {  // PANEL_ANALOG
-    if (forceDraw || ms - lastDraw >= 1000) {
+    // 通常は1秒毎。未解決アラートのバッジ点滅中は速めに再描画。
+    const uint32_t interval = activeNow ? 250 : 1000;
+    if (forceDraw || ms - lastDraw >= interval) {
       lastDraw = ms;
       renderAnalog(tm);
     }
