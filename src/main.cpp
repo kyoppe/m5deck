@@ -1073,7 +1073,7 @@ void loop() {
     float ax, ay, az;
     if (M5.Imu.getAccel(&ax, &ay, &az)) {
       const float mag = sqrtf(ax * ax + ay * ay + az * az);
-      if (fabsf(mag - 1.0f) > 0.45f) {  // 静止(約1g)から大きくズレ＝持ち上げ/移動
+      if (fabsf(mag - 1.0f) > 0.22f) {  // 静止(約1g)から少しズレ＝持ち上げ/移動（繊細め）
         angryActive = true;
         angryStart = ms;
         if (!gMuted) M5.Speaker.playWav(angryWav, angryWavLen);
