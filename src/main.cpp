@@ -22,6 +22,13 @@ static constexpr uint16_t COLOR_BLACK = TFT_BLACK;
 // 320x240（横向き）に描くためのオフスクリーンキャンバス（ちらつき防止）
 static M5Canvas canvas(&M5.Display);
 
+// ミュートアイコン用の小スプライト（不透明で1度だけ描き、毎フレームαで合成）
+static constexpr int MUTE_W = 196;
+static constexpr int MUTE_H = 150;
+static constexpr uint8_t MUTE_ALPHA = 115;  // 0..255（薄め＝約45%）
+static M5Canvas muteSpr(&M5.Display);
+static bool muteSprReady = false;
+
 // 時刻文字（HH:MM）のレイアウト（DSEG7 7セグ）
 static float timeScale = 1.0f;
 static int hhX = 0, mmX = 0, timeY = 0;
@@ -197,15 +204,63 @@ static void drawAlertBadge() {
   canvas.drawString(buf, x + w / 2, y + h / 2);
 }
 
-// ミュート中だけ、左上に薄いスピーカー消音アイコンを重ねる（全画面共通）。
+// ミュートアイコン（スピーカー＋音波＋斜線）を小スプライトに不透明で1度だけ描く。
+// 背景キーは黒(0)。アイコンは明るいグレーで描く。
+static void buildMuteSprite() {
+  muteSpr.setColorDepth(16);
+  muteSpr.setPsram(true);
+  muteSpr.createSprite(MUTE_W, MUTE_H);
+  muteSpr.fillScreen(0);  // 0 = 透明キー
+  const uint16_t ic = lgfx::color565(220, 220, 220);
+
+  // スピーカー：胴（四角）＋コーン（台形＝三角形2枚）
+  muteSpr.fillRect(16, 57, 28, 36, ic);
+  muteSpr.fillTriangle(44, 57, 44, 93, 76, 122, ic);
+  muteSpr.fillTriangle(44, 57, 76, 122, 76, 28, ic);
+
+  // 音波（右に開く弧）。スプライト上は不透明なので、点を重ねても濁らない。
+  const float wcx = 80, wcy = 75;
+  const float radii[3] = {32, 52, 72};
+  for (int k = 0; k < 3; k++) {
+    for (float a = -46; a <= 46; a += 1.5f) {
+      const float r = radii[k];
+      const float th = a * DEG_TO_RAD;
+      muteSpr.fillCircle((int)(wcx + cosf(th) * r),
+                         (int)(wcy + sinf(th) * r), 4, ic);
+    }
+  }
+
+  // 消音の斜線（太め）
+  for (int i = -4; i <= 4; i++)
+    muteSpr.drawLine(14, 16 + i, 176, 134 + i, ic);
+
+  muteSprReady = true;
+}
+
+// ミュート中だけ、アイコンを画面中央へαブレンドで重ねる（背景＝時計が透けて見える）。
 static void drawMuteOverlay() {
   if (!gMuted) return;
-  const int x = 22, y = 6;
-  const uint16_t col = lgfx::color565(120, 120, 120);
-  canvas.fillRect(x, y + 5, 4, 6, col);                       // スピーカー胴
-  canvas.fillTriangle(x + 4, y + 8, x + 11, y + 1, x + 11, y + 15, col);  // コーン
-  canvas.drawLine(x - 1, y + 1, x + 13, y + 15, col);         // 斜線（消音）
-  canvas.drawLine(x, y + 1, x + 14, y + 15, col);
+  if (!muteSprReady) buildMuteSprite();
+  const int ox = (canvas.width() - MUTE_W) / 2;
+  const int oy = (canvas.height() - MUTE_H) / 2;
+  const int A = MUTE_ALPHA, IA = 255 - A;
+  for (int y = 0; y < MUTE_H; y++) {
+    const int ty = oy + y;
+    if (ty < 0 || ty >= canvas.height()) continue;
+    for (int x = 0; x < MUTE_W; x++) {
+      if (muteSpr.readPixel(x, y) == 0) continue;  // 透明キー
+      const int tx = ox + x;
+      if (tx < 0 || tx >= canvas.width()) continue;
+      const uint16_t bg = canvas.readPixel(tx, ty);
+      const uint8_t br = ((bg >> 11) & 0x1F) * 255 / 31;
+      const uint8_t bgc = ((bg >> 5) & 0x3F) * 255 / 63;
+      const uint8_t bb = (bg & 0x1F) * 255 / 31;
+      const uint8_t R = (220 * A + br * IA) / 255;
+      const uint8_t G = (220 * A + bgc * IA) / 255;
+      const uint8_t B = (220 * A + bb * IA) / 255;
+      canvas.drawPixel(tx, ty, lgfx::color565(R, G, B));
+    }
+  }
 }
 
 // ---- デジタル時計パネル -------------------------------------------------
@@ -820,7 +875,8 @@ void loop() {
   int tapX = 0, tapY = 0;
   if (M5.Touch.getCount() > 0) {
     auto t = M5.Touch.getDetail();
-    if (t.wasPressed()) {
+    // 画面内(y<240)のみ「画面タップ」扱い。画面下の物理ボタン帯(A/B/C)は除外。
+    if (t.wasPressed() && t.y < canvas.height()) {
       tapped = true;
       tapX = t.x;
       tapY = t.y;
