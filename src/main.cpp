@@ -4,6 +4,7 @@
 
 #include "secrets.h"
 #include "MujiNum.h"  // 無印 駅の時計用の数字フォント(Jost*)
+#include "Seg7.h"     // デジタル時計用 7セグフォント(DSEG7 Classic Bold)
 
 // ---- 見た目の設定 -------------------------------------------------------
 static constexpr uint16_t COLOR_BG = TFT_BLACK;
@@ -18,9 +19,12 @@ static constexpr uint16_t COLOR_BLACK = TFT_BLACK;
 // 320x240（横向き）に描くためのオフスクリーンキャンバス（ちらつき防止）
 static M5Canvas canvas(&M5.Display);
 
-// 時刻文字（HH:MM）のレイアウト
+// 時刻文字（HH:MM）のレイアウト（DSEG7 7セグ）
 static float timeScale = 1.0f;
-static int hhX = 0, colonX = 0, mmX = 0, timeY = 0;
+static int hhX = 0, mmX = 0, timeY = 0;
+static int colonCx = 0;    // 四角コロンの中心X
+static int colonSide = 0;  // コロン四角の一辺
+static int colonDy = 0;    // 中心からの上下オフセット
 
 static bool wifiOk = false;
 static bool ntpOk = false;
@@ -101,28 +105,33 @@ static void computeLayout() {
   const int W = canvas.width();
   const int H = canvas.height();
 
-  canvas.setFont(&fonts::Font7);
+  canvas.setFont(&Seg7);
   canvas.setTextSize(1.0f);
-  const int baseDigits = canvas.textWidth("00");
-  const int baseColon = canvas.textWidth(":");
-  const int baseTotal = baseDigits * 2 + baseColon;
+  const int basePair = canvas.textWidth("00");   // 2桁ぶんの送り幅
+  const int baseGap = (int)(canvas.textWidth("0") * 0.34f);  // コロンの間隔
   const int baseH = canvas.fontHeight();
+  const int baseTotal = basePair * 2 + baseGap;
 
-  // 画面の下端に日付を置くぶんだけ残し、幅・高さの両方に収まる最大スケールを選ぶ
+  // HH:MM は横長なので横幅で頭打ちになる。左右余白を 1px まで詰めて均等スケールを最大化。
+  // （縦は余るが、黒背景なので中央寄せでOK。非均等な縦伸ばしはしない）
   const int dateArea = 22;
-  const float scaleW = (float)(W * 0.96f) / (float)baseTotal;
-  const float scaleH = (float)((H - dateArea) * 0.92f) / (float)baseH;
+  const float scaleW = (float)(W - 2) / (float)baseTotal;
+  const float scaleH = (float)(H - 2) / (float)baseH;
   timeScale = (scaleW < scaleH) ? scaleW : scaleH;
   canvas.setTextSize(timeScale);
 
-  const int hhW = canvas.textWidth("00");
-  const int colonW = canvas.textWidth(":");
-  const int total = hhW * 2 + colonW;
+  const int pairW = canvas.textWidth("00");
+  const int gapW = (int)(canvas.textWidth("0") * 0.34f);
+  const int total = pairW * 2 + gapW;
   const int startX = (W - total) / 2;
   hhX = startX;
-  colonX = startX + hhW;
-  mmX = startX + hhW + colonW;
+  mmX = startX + pairW + gapW;
+  colonCx = startX + pairW + gapW / 2;
   timeY = (H - dateArea) / 2;  // 日付ぶんを除いた領域の中央
+
+  const int digitH = canvas.fontHeight();
+  colonSide = (int)(digitH * 0.15f);  // 四角コロンの一辺
+  colonDy = (int)(digitH * 0.20f);    // 中心からの上下オフセット
 }
 
 // ---- デジタル時計パネル -------------------------------------------------
@@ -133,15 +142,19 @@ static void renderDigital(const struct tm &tm, bool colonOn) {
   snprintf(hh, sizeof(hh), "%02d", tm.tm_hour);
   snprintf(mm, sizeof(mm), "%02d", tm.tm_min);
 
-  // 大きな HH:MM（7セグ・緑）
-  canvas.setFont(&fonts::Font7);
+  // 大きな HH:MM（DSEG7 7セグ・緑）
+  canvas.setFont(&Seg7);
   canvas.setTextSize(timeScale);
   canvas.setTextColor(COLOR_GREEN, COLOR_BG);
   canvas.setTextDatum(middle_left);
   canvas.drawString(hh, hhX, timeY);
   canvas.drawString(mm, mmX, timeY);
+
+  // 四角いコロン（500ms 周期で点滅）
   if (colonOn) {
-    canvas.drawString(":", colonX, timeY);
+    const int s = colonSide;
+    canvas.fillRect(colonCx - s / 2, timeY - colonDy - s / 2, s, s, COLOR_GREEN);
+    canvas.fillRect(colonCx - s / 2, timeY + colonDy - s / 2, s, s, COLOR_GREEN);
   }
 
   // 日付（ターミナル風・小フォント）
