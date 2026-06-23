@@ -10,6 +10,17 @@
 // 認証は Authorization: Bearer <token> ヘッダ。/alert /resolve は ?k=<DD_SECRET> でも可。
 
 const KEY = "alerts";
+const TTL_MS = 2 * 60 * 60 * 1000;  // アラートの寿命（2時間）。復旧を取り逃しても自動失効。
+
+// 受信から TTL_MS を超えたアイテムを取り除く（s を破壊的に変更）
+function expire(s) {
+  const now = Date.now();
+  for (const id of Object.keys(s.items)) {
+    const rts = Number(s.items[id].rts || 0);
+    if (now - rts > TTL_MS) delete s.items[id];
+  }
+  return s;
+}
 
 function json(obj, status = 200) {
   return new Response(JSON.stringify(obj), {
@@ -34,8 +45,10 @@ async function save(env, s) {
   await env.ALERTS.put(KEY, JSON.stringify(s));
 }
 
-// デバイス向けの表示用ビュー（古い順に並べた配列＋件数）
+// デバイス向けの表示用ビュー（古い順に並べた配列＋件数）。
+// TTL 失効はここでメモリ上だけ反映する（GET では KV を書かない）。
 function view(s) {
+  expire(s);
   const ids = Object.keys(s.items);
   ids.sort((a, b) => String(s.items[a].ts || "").localeCompare(String(s.items[b].ts || "")));
   const items = ids.map((id) => ({ id, ...s.items[id] }));
@@ -97,12 +110,14 @@ export default {
           message: String(body.message || "").slice(0, 240),
           link: monUrl.slice(0, 300),
           ts: String(body.ts || new Date().toISOString()),
+          rts: Date.now(),  // 受信時刻（TTL 用）
         };
         s.seq = (s.seq || 0) + 1;  // 新規発報のたびに +1 → デバイスがサイレン再鳴動
       } else {
         if (body.id != null) delete s.items[id];
         else s.items = {};  // id 指定なしは全消し（手動リセット用）
       }
+      expire(s);  // 書き込み時に失効分を物理削除
       await save(env, s);
       return json({ ok: true, action, ...view(s) });
     }
@@ -125,6 +140,21 @@ export default {
       s.ackSeq = Number(body.seq != null ? body.seq : (s.seq || 0));
       await save(env, s);
       return json({ ok: true, ackSeq: s.ackSeq });
+    }
+
+    // デバイスからの手動クリア（アラート単位。id 無しは全消し）
+    if (method === "POST" && path === "/clear") {
+      if (!env.DEVICE_TOKEN || bearer(req) !== env.DEVICE_TOKEN) {
+        return json({ error: "unauthorized" }, 401);
+      }
+      let body = {};
+      try { body = await req.json(); } catch (_) {}
+      const s = await load(env);
+      if (body.id != null && String(body.id).length) delete s.items[String(body.id)];
+      else s.items = {};
+      expire(s);
+      await save(env, s);
+      return json({ ok: true, ...view(s) });
     }
 
     if (path === "/") return json({ ok: true, service: "m5deck-alert" });

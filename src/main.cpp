@@ -45,12 +45,19 @@ static volatile bool gAlertActive = false;    // サーバが ALERT 状態か
 static volatile long alertSeq = 0;            // サーバの発報シーケンス
 static volatile long alertAckedSeq = 0;       // 確認済みシーケンス
 static volatile int alertCount = 0;           // 現在のアラート件数
+static String alId[MAX_ALERTS];               // mutex 保護: アラートID（クリア用）
 static String alMon[MAX_ALERTS];              // mutex 保護: モニター名
 static String alPri[MAX_ALERTS];              // mutex 保護: 優先度
 static String alLink[MAX_ALERTS];             // mutex 保護: Datadog $LINK
 static SemaphoreHandle_t alertMux = nullptr;
 static bool hubDismissed = false;             // 調査ハブ画面を閉じたか
 static int hubIndex = 0;                       // ハブで表示中のアラート番号
+
+// ハブ画面の「CLEAR」ボタン領域（画面座標）。この中をタップ＝表示中の1件を消す。
+static constexpr int CLR_X = 16;
+static constexpr int CLR_Y = 192;
+static constexpr int CLR_W = 96;
+static constexpr int CLR_H = 30;
 
 // サイレン鳴動中か（未確認の ALERT がある）
 static inline bool sirenActive() {
@@ -337,6 +344,7 @@ static void pollAlert() {
       int n = 0;
       for (JsonObject it : items) {
         if (n >= MAX_ALERTS) break;
+        alId[n] = String((const char *)(it["id"] | ""));
         alMon[n] = String((const char *)(it["monitor"] | ""));
         alPri[n] = String((const char *)(it["priority"] | ""));
         alLink[n] = String((const char *)(it["link"] | ""));
@@ -379,6 +387,41 @@ static void ackAlert() {
   int code = https.POST(body);
   Serial.printf("ackAlert seq=%ld HTTP %d\n", seq, code);
   https.end();
+}
+
+// アラートを1件だけ手動クリア（Worker /clear）。成功したらローカルからも即除去。
+static void clearAlert(const String &id) {
+  if (id.length() == 0 || WiFi.status() != WL_CONNECTED) return;
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient https;
+  String url = String(ALERT_WORKER_URL) + "/clear";
+  if (!https.begin(client, url)) return;
+  https.addHeader("Authorization", String("Bearer ") + ALERT_DEVICE_TOKEN);
+  https.addHeader("Content-Type", "application/json");
+  https.setTimeout(8000);
+  String body = String("{\"id\":\"") + id + "\"}";
+  int code = https.POST(body);
+  Serial.printf("clearAlert id=%s HTTP %d\n", id.c_str(), code);
+  https.end();
+  if (code != 200) return;
+  // ローカル配列からも詰めて除去（次のポーリングを待たず即反映）
+  if (alertMux) xSemaphoreTake(alertMux, portMAX_DELAY);
+  int n = alertCount, w = 0;
+  for (int i = 0; i < n; i++) {
+    if (alId[i] == id) continue;
+    if (w != i) {
+      alId[w] = alId[i];
+      alMon[w] = alMon[i];
+      alPri[w] = alPri[i];
+      alLink[w] = alLink[i];
+    }
+    w++;
+  }
+  alertCount = w;
+  if (hubIndex >= w) hubIndex = (w > 0) ? w - 1 : 0;
+  if (alertMux) xSemaphoreGive(alertMux);
+  gAlertActive = (alertCount > 0);
 }
 
 // サイレン音：2音を交互に鳴らす（呼び出すたびに継続更新）
@@ -560,9 +603,16 @@ static void renderHub() {
   canvas.drawString("Datadog", 16, 92);
   canvas.drawString("app", 16, 112);
 
-  // フッタの操作ヒント
+  // 操作ヒント（QR側タップで次/戻る）
   canvas.setTextColor(lgfx::color565(150, 150, 150), COLOR_BG);
-  canvas.drawString(count > 1 ? "tap: next / back" : "tap: back", 16, H - 26);
+  canvas.drawString(count > 1 ? "tap: next" : "tap: back", 16, 140);
+
+  // CLEAR ボタン（この1件を手動で消す）
+  canvas.drawRoundRect(CLR_X, CLR_Y, CLR_W, CLR_H, 6, COLOR_RED);
+  canvas.setTextDatum(middle_center);
+  canvas.setTextColor(lgfx::color565(255, 90, 90), COLOR_BG);
+  canvas.setFont(&fonts::Font2);
+  canvas.drawString("CLEAR", CLR_X + CLR_W / 2, CLR_Y + CLR_H / 2);
 
   canvas.pushSprite(0, 0);
 }
@@ -618,11 +668,16 @@ void loop() {
     forceDraw = true;
   }
 
-  // タップ検出
+  // タップ検出（座標も保持）
   bool tapped = false;
+  int tapX = 0, tapY = 0;
   if (M5.Touch.getCount() > 0) {
     auto t = M5.Touch.getDetail();
-    if (t.wasPressed()) tapped = true;
+    if (t.wasPressed()) {
+      tapped = true;
+      tapX = t.x;
+      tapY = t.y;
+    }
   }
 
   // ---- アラート層 ① サイレン（未確認の ALERT）：時計より優先 ----
@@ -644,14 +699,28 @@ void loop() {
   M5.Speaker.stop();
 
   // ---- アラート層 ② 調査ハブ（確認済みだが ALERT 継続中）----
-  // タップで次のアラートのQRへ。最後まで送ったら時計へ戻る。
+  // CLEAR ボタン内タップ＝表示中の1件を消す。それ以外のタップ＝次のQRへ（最後で時計へ）。
   if (activeNow && !hubDismissed) {
     if (tapped) {
       tapped = false;
-      hubIndex++;
-      if (hubIndex >= alertCount) {  // 最後の次 → 閉じる
-        hubDismissed = true;
-        hubIndex = 0;
+      const bool hitClear = (tapX >= CLR_X && tapX <= CLR_X + CLR_W &&
+                             tapY >= CLR_Y && tapY <= CLR_Y + CLR_H);
+      if (hitClear) {
+        String id;
+        if (alertMux) xSemaphoreTake(alertMux, portMAX_DELAY);
+        if (hubIndex < alertCount) id = alId[hubIndex];
+        if (alertMux) xSemaphoreGive(alertMux);
+        clearAlert(id);
+        if (alertCount == 0) {  // 最後の1件を消した → 時計へ
+          hubDismissed = true;
+          hubIndex = 0;
+        }
+      } else {
+        hubIndex++;
+        if (hubIndex >= alertCount) {  // 最後の次 → 閉じる
+          hubDismissed = true;
+          hubIndex = 0;
+        }
       }
       forceDraw = true;
     }
