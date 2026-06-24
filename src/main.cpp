@@ -879,6 +879,44 @@ static bool isAsciiStr(const String &s) {
   return true;
 }
 
+// 現在のフォントで maxW に収まるよう text を行分割（UTF-8対応）。
+// ASCIIは直前の半角スペースで折り返し、日本語は任意位置で折り返す。
+// 返り値は行数。out[] に各行を格納（maxLines まで）。
+static int wrapTitle(const String &text, int maxW, String out[], int maxLines) {
+  int n = 0;
+  String cur = "";
+  int i = 0;
+  const int len = text.length();
+  while (i < len) {
+    int clen = 1;  // UTF-8 のバイト数
+    const uint8_t c = (uint8_t)text[i];
+    if (c >= 0xF0) clen = 4;
+    else if (c >= 0xE0) clen = 3;
+    else if (c >= 0xC0) clen = 2;
+    const String ch = text.substring(i, i + clen);
+    const String trial = cur + ch;
+    if (canvas.textWidth(trial.c_str()) > maxW && cur.length() > 0) {
+      const int sp = (c < 0x80) ? cur.lastIndexOf(' ') : -1;
+      if (sp > 0) {  // ASCII は単語境界（直前の空白）で折る
+        if (n < maxLines) out[n++] = cur.substring(0, sp);
+        cur = cur.substring(sp + 1) + ch;
+      } else {
+        if (n < maxLines) out[n++] = cur;
+        cur = ch;
+      }
+      if (n >= maxLines) {
+        cur = "";
+        break;
+      }
+    } else {
+      cur = trial;
+    }
+    i += clen;
+  }
+  if (cur.length() > 0 && n < maxLines) out[n++] = cur;
+  return n;
+}
+
 // カレンダー通知画面：落ち着いた青に、時刻レンジ＋予定名を大きく全画面表示。
 static void renderReminder() {
   const int W = canvas.width();
@@ -917,13 +955,17 @@ static void renderReminder() {
   canvas.setTextSize(1.0f);
   canvas.drawString(range, W / 2, 10);
 
-  // 予定名（全画面・大きく・ポップに）。文字数に応じてフォントを自動縮小して溢れ防止。
+  // 予定名（全画面・大きく・ポップに）。
+  // 方針: まず大きいフォントのまま折り返し、縦に収まらなければフォントを1段縮小。
   // 英語＝極太サンセリフ、日本語＝ゴシック＋簡易ボールド。
   canvas.setTextColor(TFT_WHITE, COLOR_CAL);
   const bool jp = !isAsciiStr(title);
   const int maxW = W - 24;
+  const int titleTop = 52;        // 時刻レンジの下
+  const int titleBottom = H - 34;  // カウントダウンの上
+  const int availH = titleBottom - titleTop;
 
-  // 大きい順に候補フォントを並べ、1行に収まる最大サイズを採用
+  // 大きい順の候補フォント
   const lgfx::IFont *cand[5];
   int nCand = 0;
   if (jp) {
@@ -939,37 +981,38 @@ static void renderReminder() {
     cand[nCand++] = &fonts::FreeSansBold9pt7b;
   }
   canvas.setTextSize(1.0f);
-  int chosen = nCand - 1;  // 既定は最小
+
+  // 大きい順に「折り返して縦に収まる」最大フォントを採用
+  String lines[6];
+  int nLines = 0;
+  int chosen = nCand - 1;
   for (int i = 0; i < nCand; i++) {
     canvas.setFont(cand[i]);
-    if (canvas.textWidth(title.c_str()) <= maxW) {
+    String tmp[6];
+    const int ln = wrapTitle(title, maxW, tmp, 6);
+    const int lineH = canvas.fontHeight();
+    const int gap = lineH / 6;
+    const int blockH = ln * lineH + (ln - 1) * gap;
+    if (blockH <= availH || i == nCand - 1) {  // 収まる or 最小フォント
       chosen = i;
+      nLines = ln;
+      for (int k = 0; k < ln; k++) lines[k] = tmp[k];
       break;
     }
   }
+
+  // 縦中央に複数行を描画
   canvas.setFont(cand[chosen]);
-
-  // ASCIIの短い予定は最大サイズをさらに拡大して迫力を出す（溢れない範囲で）
-  float sz = 1.0f;
-  if (!jp && chosen == 0 && title.length() <= 9) {
-    canvas.setTextSize(1.4f);
-    if (canvas.textWidth(title.c_str()) <= maxW) sz = 1.4f;
-  }
-  canvas.setTextSize(sz);
-
-  const int tw = canvas.textWidth(title.c_str());
-  if (tw <= maxW) {  // 1 行に収まるなら中央寄せ
-    canvas.setTextDatum(middle_center);
-    const int ty = H / 2 + 6;
-    canvas.drawString(title.c_str(), W / 2, ty);
-    if (jp) canvas.drawString(title.c_str(), W / 2 + 1, ty);  // 簡易ボールドでポップ感
-  } else {  // 極端に長い場合のみ最小フォントで自動折り返し（左寄せ）
-    canvas.setTextSize(1.0f);
-    canvas.setTextDatum(top_left);
-    canvas.setTextWrap(true);
-    canvas.setCursor(14, 70);
-    canvas.print(title);
-    canvas.setTextWrap(false);
+  const int lineH = canvas.fontHeight();
+  const int gap = lineH / 6;
+  const int blockH = nLines * lineH + (nLines - 1) * gap;
+  int y = titleTop + (availH - blockH) / 2;
+  if (y < titleTop) y = titleTop;
+  canvas.setTextDatum(top_center);
+  for (int k = 0; k < nLines; k++) {
+    canvas.drawString(lines[k].c_str(), W / 2, y);
+    if (jp) canvas.drawString(lines[k].c_str(), W / 2 + 1, y);  // 簡易ボールド
+    y += lineH + gap;
   }
 
   // カウントダウン＋操作ヒント（下部）
@@ -1085,7 +1128,7 @@ static void renderHr(uint32_t ms) {
 
   // ---- レイアウト領域（320x240 固定）----
   // 上: ステータス(0..30) / 中: メイン(30..208) / 下: ゾーン・操作(208..240)
-  const int yMid = 118;           // メイン領域の縦中心
+  const int yMid = 106;           // メイン領域の縦中心（bpm/ゾーンの余白を確保）
   const int heartR = 22;          // ハート基準半径（脈動で最大 +9）
   const int gap = 28;             // ハートと数値の間隔
 
@@ -1093,11 +1136,11 @@ static void renderHr(uint32_t ms) {
   if (hasData) snprintf(buf, sizeof(buf), "%d", hrBpm);
   else snprintf(buf, sizeof(buf), "--");
 
-  // 数値の高さを ~132px に正規化（実測ベース。桁数で幅が溢れる場合は幅で頭打ち）
+  // 数値の高さを ~124px に正規化（実測ベース。桁数で幅が溢れる場合は幅で頭打ち）
   canvas.setFont(&Seg7);
   canvas.setTextSize(1.0f);
   const int baseH = canvas.fontHeight();
-  float numScale = 132.0f / (float)baseH;
+  float numScale = 124.0f / (float)baseH;
   canvas.setTextSize(numScale);
   int numW = canvas.textWidth(buf);
   const int maxGroupW = W - 12;
@@ -1106,6 +1149,7 @@ static void renderHr(uint32_t ms) {
     canvas.setTextSize(numScale);
     numW = canvas.textWidth(buf);
   }
+  const int numH = canvas.fontHeight();  // 実際の数値高さ（bpm位置の基準）
 
   // 「ハート＋数値」を1グループとして横中央に配置
   const int groupW = heartR * 2 + gap + numW;
@@ -1130,12 +1174,12 @@ static void renderHr(uint32_t ms) {
       hasData ? lgfx::color565(235, 45, 65) : lgfx::color565(90, 90, 100);
   drawHeart(heartCx, yMid, beatR, heartCol);
 
-  // bpm ラベル（数値の真下・中央。右にはみ出さない）
+  // bpm ラベル（数値の下端＋4px・中央。ゾーンと重ならない位置に実測で配置）
   canvas.setFont(&fonts::Font2);
   canvas.setTextSize(1.0f);
   canvas.setTextColor(lgfx::color565(150, 150, 160), bg);
   canvas.setTextDatum(top_center);
-  canvas.drawString("bpm", numCx, yMid + 70);
+  canvas.drawString("bpm", numCx, yMid + numH / 2 + 4);
 
   // ゾーン（最下部・中央）
   if (hasData) {
