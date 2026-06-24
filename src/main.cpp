@@ -1080,41 +1080,71 @@ static void renderHr(uint32_t ms) {
                                                      : "HEART RATE";
   canvas.drawString(status, W / 2, 10);
 
-  // 心拍に合わせて脈動するハート
   int zone = 0;
   const uint16_t zcol = hrZoneColor(hasData ? hrBpm : 0, &zone);
-  const int baseR = 28;
-  int beatR = baseR;
+
+  // ---- レイアウト領域（320x240 固定）----
+  // 上: ステータス(0..30) / 中: メイン(30..208) / 下: ゾーン・操作(208..240)
+  const int yMid = 118;           // メイン領域の縦中心
+  const int heartR = 22;          // ハート基準半径（脈動で最大 +9）
+  const int gap = 28;             // ハートと数値の間隔
+
+  char buf[8];
+  if (hasData) snprintf(buf, sizeof(buf), "%d", hrBpm);
+  else snprintf(buf, sizeof(buf), "--");
+
+  // 数値の高さを ~132px に正規化（実測ベース。桁数で幅が溢れる場合は幅で頭打ち）
+  canvas.setFont(&Seg7);
+  canvas.setTextSize(1.0f);
+  const int baseH = canvas.fontHeight();
+  float numScale = 132.0f / (float)baseH;
+  canvas.setTextSize(numScale);
+  int numW = canvas.textWidth(buf);
+  const int maxGroupW = W - 12;
+  if (heartR * 2 + gap + numW > maxGroupW) {  // 幅オーバーなら数値を縮小
+    numScale *= (float)(maxGroupW - heartR * 2 - gap) / (float)numW;
+    canvas.setTextSize(numScale);
+    numW = canvas.textWidth(buf);
+  }
+
+  // 「ハート＋数値」を1グループとして横中央に配置
+  const int groupW = heartR * 2 + gap + numW;
+  const int groupX = (W - groupW) / 2;
+  const int heartCx = groupX + heartR;
+  const int numCx = groupX + heartR * 2 + gap + numW / 2;
+
+  // 大きな BPM 数値（7セグ・縦中心 yMid）
+  canvas.setTextDatum(middle_center);
+  canvas.setTextColor(hasData ? zcol : lgfx::color565(70, 70, 80), bg);
+  canvas.drawString(buf, numCx, yMid);
+
+  // 脈動ハート（数値の左に、縦位置を合わせて）
+  int beatR = heartR;
   if (hasData) {
     const float period = 60000.0f / hrBpm;               // 1拍(ms)
     const float ph = fmodf((float)ms, period) / period;  // 0..1
     const float env = expf(-ph * 4.0f);                  // 立ち上がりで“ドクン”
-    beatR = baseR + (int)(env * 12);
+    beatR = heartR + (int)(env * 9);
   }
   const uint16_t heartCol =
       hasData ? lgfx::color565(235, 45, 65) : lgfx::color565(90, 90, 100);
-  drawHeart(W / 2, 78, beatR, heartCol);
+  drawHeart(heartCx, yMid, beatR, heartCol);
 
-  // BPM 数値（7セグ）
-  canvas.setFont(&Seg7);
-  canvas.setTextSize(1.5f);
-  canvas.setTextDatum(middle_center);
+  // bpm ラベル（数値の真下・中央。右にはみ出さない）
+  canvas.setFont(&fonts::Font2);
+  canvas.setTextSize(1.0f);
+  canvas.setTextColor(lgfx::color565(150, 150, 160), bg);
+  canvas.setTextDatum(top_center);
+  canvas.drawString("bpm", numCx, yMid + 70);
+
+  // ゾーン（最下部・中央）
   if (hasData) {
-    char buf[8];
-    snprintf(buf, sizeof(buf), "%d", hrBpm);
-    canvas.setTextColor(zcol, bg);
-    canvas.drawString(buf, W / 2, 155);
-
-    // ゾーン表示
     char zb[16];
     snprintf(zb, sizeof(zb), "Z%d   %d%%", zone, hrBpm * 100 / HR_MAX);
     canvas.setFont(&fonts::FreeSansBold12pt7b);
     canvas.setTextColor(zcol, bg);
-    canvas.setTextDatum(top_center);
-    canvas.drawString(zb, W / 2, 196);
-  } else {
-    canvas.setTextColor(lgfx::color565(70, 70, 80), bg);
-    canvas.drawString("--", W / 2, 155);
+    canvas.setTextDatum(bottom_center);
+    canvas.drawString(zb, W / 2, H - 6);
   }
 
   // 操作ヒント
