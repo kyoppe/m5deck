@@ -3,6 +3,7 @@
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <NimBLEDevice.h>  // 心拍モード: Coros等のHRブロードキャスト受信(BLE central)
 #include <time.h>
 
 #include "secrets.h"
@@ -44,6 +45,84 @@ static bool ntpOk = false;
 enum Panel { PANEL_DIGITAL = 0, PANEL_ANALOG = 1, PANEL_COUNT = 2 };
 static int currentPanel = PANEL_DIGITAL;
 static bool showBattery = false;  // ボタンBでトグル：右上にバッテリー残量を表示
+
+// ---- 心拍モード（BLE: Coros等のHRブロードキャストを受信）-----------------
+// ボタンAでON/OFF。Coros側で「心拍数ブロードキャスト」をONにしておくこと。
+static constexpr int HR_MAX = 190;  // 最大心拍(ゾーン計算用)。220-年齢などで各自調整
+
+enum HrState { HRS_IDLE = 0, HRS_SCAN, HRS_CONNECTING, HRS_CONNECTED };
+static volatile bool hrMode = false;
+static volatile HrState hrState = HRS_IDLE;
+static volatile int hrBpm = 0;
+static volatile uint32_t hrLastData = 0;
+static NimBLEAddress hrAddr;
+static volatile bool hrHasAddr = false;
+static volatile bool hrNeedScan = false;
+static NimBLEClient *hrClient = nullptr;
+static bool bleInited = false;
+
+// 心拍計測キャラクタリスティック(0x2A37)の通知。先頭フラグでbpmが8/16bitか決まる。
+static void hrNotifyCB(NimBLERemoteCharacteristic *chr, uint8_t *data,
+                       size_t len, bool isNotify) {
+  if (len < 2) return;
+  const uint8_t flags = data[0];
+  const int bpm = (flags & 0x01) ? (data[1] | (data[2] << 8)) : data[1];
+  if (bpm > 0 && bpm < 250) {
+    hrBpm = bpm;
+    hrLastData = millis();
+  }
+}
+
+// スキャンで HR Service(0x180D) を広告している端末を見つけたらアドレスを保持。
+class HrScanCallbacks : public NimBLEScanCallbacks {
+  void onResult(const NimBLEAdvertisedDevice *dev) override {
+    if (hrState != HRS_SCAN || hrHasAddr) return;
+    if (dev->isAdvertisingService(NimBLEUUID((uint16_t)0x180D))) {
+      hrAddr = dev->getAddress();
+      hrHasAddr = true;
+      NimBLEDevice::getScan()->stop();
+      Serial.printf("HR device found: %s\n", hrAddr.toString().c_str());
+    }
+  }
+};
+static HrScanCallbacks hrScanCallbacks;
+
+class HrClientCallbacks : public NimBLEClientCallbacks {
+  void onDisconnect(NimBLEClient *c, int reason) override {
+    Serial.printf("HR disconnected (reason %d)\n", reason);
+    hrBpm = 0;
+    if (hrMode) {  // モード継続中なら再スキャンへ
+      hrState = HRS_SCAN;
+      hrHasAddr = false;
+      hrNeedScan = true;
+    }
+  }
+};
+static HrClientCallbacks hrClientCallbacks;
+
+static bool hrConnect() {
+  if (!hrClient) {
+    hrClient = NimBLEDevice::createClient();
+    hrClient->setClientCallbacks(&hrClientCallbacks, false);
+  }
+  if (!hrClient->connect(hrAddr)) return false;
+  NimBLERemoteService *svc = hrClient->getService(NimBLEUUID((uint16_t)0x180D));
+  if (!svc) {
+    hrClient->disconnect();
+    return false;
+  }
+  NimBLERemoteCharacteristic *chr =
+      svc->getCharacteristic(NimBLEUUID((uint16_t)0x2A37));
+  if (!chr) {
+    hrClient->disconnect();
+    return false;
+  }
+  if (chr->canNotify() && !chr->subscribe(true, hrNotifyCB)) {
+    hrClient->disconnect();
+    return false;
+  }
+  return true;
+}
 
 // ---- Datadog アラート ---------------------------------------------------
 // ポーリングは別タスク(core0)で実行し、メインループ(core1)を止めない。
@@ -838,26 +917,57 @@ static void renderReminder() {
   canvas.setTextSize(1.0f);
   canvas.drawString(range, W / 2, 10);
 
-  // 予定名（全画面・大きく・ポップに）。英語＝極太サンセリフ、日本語＝ゴシック＋簡易ボールド。
+  // 予定名（全画面・大きく・ポップに）。文字数に応じてフォントを自動縮小して溢れ防止。
+  // 英語＝極太サンセリフ、日本語＝ゴシック＋簡易ボールド。
   canvas.setTextColor(TFT_WHITE, COLOR_CAL);
   const bool jp = !isAsciiStr(title);
+  const int maxW = W - 24;
+
+  // 大きい順に候補フォントを並べ、1行に収まる最大サイズを採用
+  const lgfx::IFont *cand[5];
+  int nCand = 0;
   if (jp) {
-    canvas.setFont(&fonts::lgfxJapanGothicP_32);
-    canvas.setTextSize(1.0f);
+    cand[nCand++] = &fonts::lgfxJapanGothicP_32;
+    cand[nCand++] = &fonts::lgfxJapanGothicP_28;
+    cand[nCand++] = &fonts::lgfxJapanGothicP_24;
+    cand[nCand++] = &fonts::lgfxJapanGothicP_20;
+    cand[nCand++] = &fonts::lgfxJapanGothicP_16;
   } else {
-    canvas.setFont(&fonts::FreeSansBold24pt7b);
-    canvas.setTextSize(title.length() <= 9 ? 1.4f : 1.0f);
+    cand[nCand++] = &fonts::FreeSansBold24pt7b;
+    cand[nCand++] = &fonts::FreeSansBold18pt7b;
+    cand[nCand++] = &fonts::FreeSansBold12pt7b;
+    cand[nCand++] = &fonts::FreeSansBold9pt7b;
   }
+  canvas.setTextSize(1.0f);
+  int chosen = nCand - 1;  // 既定は最小
+  for (int i = 0; i < nCand; i++) {
+    canvas.setFont(cand[i]);
+    if (canvas.textWidth(title.c_str()) <= maxW) {
+      chosen = i;
+      break;
+    }
+  }
+  canvas.setFont(cand[chosen]);
+
+  // ASCIIの短い予定は最大サイズをさらに拡大して迫力を出す（溢れない範囲で）
+  float sz = 1.0f;
+  if (!jp && chosen == 0 && title.length() <= 9) {
+    canvas.setTextSize(1.4f);
+    if (canvas.textWidth(title.c_str()) <= maxW) sz = 1.4f;
+  }
+  canvas.setTextSize(sz);
+
   const int tw = canvas.textWidth(title.c_str());
-  if (tw <= W - 24) {  // 1 行に収まるなら中央寄せ
+  if (tw <= maxW) {  // 1 行に収まるなら中央寄せ
     canvas.setTextDatum(middle_center);
     const int ty = H / 2 + 6;
     canvas.drawString(title.c_str(), W / 2, ty);
     if (jp) canvas.drawString(title.c_str(), W / 2 + 1, ty);  // 簡易ボールドでポップ感
-  } else {             // 収まらなければ自動折り返し（左寄せ）
+  } else {  // 極端に長い場合のみ最小フォントで自動折り返し（左寄せ）
+    canvas.setTextSize(1.0f);
     canvas.setTextDatum(top_left);
     canvas.setTextWrap(true);
-    canvas.setCursor(14, 78);
+    canvas.setCursor(14, 70);
     canvas.print(title);
     canvas.setTextWrap(false);
   }
@@ -911,6 +1021,108 @@ static void renderAngry(uint32_t ms) {
   // 口（への字・開き）
   canvas.fillTriangle(cx - 46, cy + 60, cx + 46, cy + 60, cx, cy + 30,
                       lgfx::color565(20, 0, 0));
+
+  drawMuteOverlay();
+  canvas.pushSprite(0, 0);
+}
+
+// ---- 心拍モード画面 -----------------------------------------------------
+static void drawHeart(int cx, int cy, int r, uint16_t col) {
+  canvas.fillCircle(cx - r / 2, cy - r / 5, (r * 6) / 10, col);
+  canvas.fillCircle(cx + r / 2, cy - r / 5, (r * 6) / 10, col);
+  canvas.fillTriangle(cx - r, cy, cx + r, cy, cx, cy + (r * 13) / 10, col);
+}
+
+// 最大心拍に対する割合でゾーン(0..5)と色を返す。
+static uint16_t hrZoneColor(int bpm, int *zoneOut) {
+  const int pct = (bpm <= 0) ? 0 : bpm * 100 / HR_MAX;
+  int z;
+  uint16_t c;
+  if (pct < 50) {
+    z = 0;
+    c = lgfx::color565(120, 130, 150);
+  } else if (pct < 60) {
+    z = 1;
+    c = lgfx::color565(70, 160, 255);
+  } else if (pct < 70) {
+    z = 2;
+    c = lgfx::color565(0, 220, 90);
+  } else if (pct < 80) {
+    z = 3;
+    c = lgfx::color565(240, 210, 40);
+  } else if (pct < 90) {
+    z = 4;
+    c = lgfx::color565(255, 140, 0);
+  } else {
+    z = 5;
+    c = lgfx::color565(240, 40, 40);
+  }
+  if (zoneOut) *zoneOut = z;
+  return c;
+}
+
+static void renderHr(uint32_t ms) {
+  const uint16_t bg = lgfx::color565(12, 12, 16);
+  canvas.fillScreen(bg);
+  const int W = canvas.width();
+  const int H = canvas.height();
+
+  const bool connected = (hrState == HRS_CONNECTED);
+  const bool hasData = connected && (ms - hrLastData < 5000) && hrBpm > 0;
+
+  // ステータス行
+  canvas.setTextDatum(top_center);
+  canvas.setFont(&fonts::lgfxJapanGothicP_16);
+  canvas.setTextColor(lgfx::color565(180, 180, 195), bg);
+  const char *status = (hrState == HRS_SCAN)         ? "心拍センサーを探索中..."
+                       : (hrState == HRS_CONNECTING) ? "接続中..."
+                       : (connected && !hasData)     ? "接続済み（データ待ち）"
+                                                     : "HEART RATE";
+  canvas.drawString(status, W / 2, 10);
+
+  // 心拍に合わせて脈動するハート
+  int zone = 0;
+  const uint16_t zcol = hrZoneColor(hasData ? hrBpm : 0, &zone);
+  const int baseR = 28;
+  int beatR = baseR;
+  if (hasData) {
+    const float period = 60000.0f / hrBpm;               // 1拍(ms)
+    const float ph = fmodf((float)ms, period) / period;  // 0..1
+    const float env = expf(-ph * 4.0f);                  // 立ち上がりで“ドクン”
+    beatR = baseR + (int)(env * 12);
+  }
+  const uint16_t heartCol =
+      hasData ? lgfx::color565(235, 45, 65) : lgfx::color565(90, 90, 100);
+  drawHeart(W / 2, 78, beatR, heartCol);
+
+  // BPM 数値（7セグ）
+  canvas.setFont(&Seg7);
+  canvas.setTextSize(1.5f);
+  canvas.setTextDatum(middle_center);
+  if (hasData) {
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%d", hrBpm);
+    canvas.setTextColor(zcol, bg);
+    canvas.drawString(buf, W / 2, 155);
+
+    // ゾーン表示
+    char zb[16];
+    snprintf(zb, sizeof(zb), "Z%d   %d%%", zone, hrBpm * 100 / HR_MAX);
+    canvas.setFont(&fonts::FreeSansBold12pt7b);
+    canvas.setTextColor(zcol, bg);
+    canvas.setTextDatum(top_center);
+    canvas.drawString(zb, W / 2, 196);
+  } else {
+    canvas.setTextColor(lgfx::color565(70, 70, 80), bg);
+    canvas.drawString("--", W / 2, 155);
+  }
+
+  // 操作ヒント
+  canvas.setFont(&fonts::Font2);
+  canvas.setTextSize(1.0f);
+  canvas.setTextColor(lgfx::color565(110, 110, 120), bg);
+  canvas.setTextDatum(bottom_left);
+  canvas.drawString("A: 終了", 8, H - 6);
 
   drawMuteOverlay();
   canvas.pushSprite(0, 0);
@@ -985,6 +1197,55 @@ void loop() {
     showBattery = !showBattery;
     forceDraw = true;
     Serial.printf("battery overlay -> %d\n", showBattery ? 1 : 0);
+  }
+
+  // 物理 A ボタン（左下）で心拍モード（BLE: Coros等のHRブロードキャスト）をトグル。
+  if (M5.BtnA.wasPressed()) {
+    hrMode = !hrMode;
+    forceDraw = true;
+    if (hrMode) {
+      if (!bleInited) {
+        NimBLEDevice::init("m5deck");
+        NimBLEScan *sc = NimBLEDevice::getScan();
+        sc->setScanCallbacks(&hrScanCallbacks, false);
+        sc->setActiveScan(true);
+        sc->setInterval(100);
+        sc->setWindow(80);
+        bleInited = true;
+      }
+      hrBpm = 0;
+      hrHasAddr = false;
+      hrState = HRS_SCAN;
+      hrNeedScan = true;
+    } else {
+      if (hrClient && hrClient->isConnected()) hrClient->disconnect();
+      if (bleInited) NimBLEDevice::getScan()->stop();
+      hrState = HRS_IDLE;
+      hrBpm = 0;
+    }
+    Serial.printf("HR mode -> %d\n", hrMode ? 1 : 0);
+  }
+
+  // 心拍モードのBLE状態遷移（アラート表示中も接続維持のため毎ループ実行）
+  if (hrMode) {
+    if (hrNeedScan && hrState == HRS_SCAN) {
+      hrNeedScan = false;
+      NimBLEDevice::getScan()->start(0, false);  // 0=無制限スキャン
+    }
+    if (hrState == HRS_SCAN && hrHasAddr) {
+      hrState = HRS_CONNECTING;
+      forceDraw = true;
+    }
+    if (hrState == HRS_CONNECTING) {
+      if (hrConnect()) {
+        hrState = HRS_CONNECTED;
+      } else {
+        hrHasAddr = false;
+        hrState = HRS_SCAN;
+        hrNeedScan = true;
+      }
+      forceDraw = true;
+    }
   }
 
   // タップ検出（座標も保持）
@@ -1130,7 +1391,7 @@ void loop() {
   constexpr uint32_t ANGRY_MS = 5000;        // 怒り顔の表示時間（振動も同じ間ずっと）
   constexpr uint32_t ANGRY_COOLDOWN = 5000;  // 連続で怒らないように
 
-  if (!angryActive && !activeNow && remSeqNow <= remAckedSeq &&
+  if (!angryActive && !activeNow && !hrMode && remSeqNow <= remAckedSeq &&
       ms - lastAngry > ANGRY_COOLDOWN) {
     float ax, ay, az;
     if (M5.Imu.getAccel(&ax, &ay, &az)) {
@@ -1162,11 +1423,22 @@ void loop() {
     return;
   }
 
-  // 画面タップでパネルを切り替え（アラート無し時のみ）
-  if (tapped) {
+  // 画面タップでパネルを切り替え（アラート無し時のみ。心拍モード中は無効）
+  if (tapped && !hrMode) {
     currentPanel = (currentPanel + 1) % PANEL_COUNT;
     forceDraw = true;
     Serial.printf("panel -> %d\n", currentPanel);
+  }
+
+  // 心拍モード中は時計の代わりに心拍画面を表示
+  if (hrMode) {
+    if (forceDraw || ms - lastDraw >= 100) {
+      lastDraw = ms;
+      renderHr(ms);
+    }
+    forceDraw = false;
+    delay(15);
+    return;
   }
 
   time_t now = time(nullptr);
