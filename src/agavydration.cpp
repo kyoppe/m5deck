@@ -238,7 +238,14 @@ void agavOnWeightModeEnter() {
     agavSetStatus("AGAV_API_URL unset");
     return;
   }
-  agavRefreshPlants();
+  if (agavPlantCountN > 0) {
+    agavApiStateN = AGAV_API_READY;
+    snprintf(agavStatusBuf, sizeof(agavStatusBuf), "%d plants ready",
+             agavPlantCountN);
+  } else {
+    agavApiStateN = AGAV_API_IDLE;
+    agavSetStatus("loading plants...");
+  }
 }
 
 static void agavClearSent() {
@@ -256,6 +263,11 @@ void agavOnWeightModeExit() {
 
 void agavRefreshPlants() {
   if (!agavUrlConfigured()) return;
+  agavFetchPlants();
+}
+
+void agavLoadPlantsIfNeeded() {
+  if (!agavUrlConfigured() || agavPlantCountN > 0) return;
   agavFetchPlants();
 }
 

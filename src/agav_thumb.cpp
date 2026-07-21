@@ -231,7 +231,11 @@ void agavThumbShutdown() {
 
 void agavThumbRequest(int plantIndex) {
   if (plantIndex < 0) return;
-  if (cacheFind(plantIndex) >= 0) return;
+  if (cacheFind(plantIndex) >= 0) {
+    gThumbPending = -1;
+    gThumbPendingSinceMs = 0;
+    return;
+  }
   gThumbPending = plantIndex;
   gThumbPendingSinceMs = millis();
 }

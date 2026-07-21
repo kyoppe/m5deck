@@ -86,6 +86,9 @@ static bool weightMode = false;
 static bool manualTareActive = false;
 static uint32_t weightLastActivityMs = 0;
 static constexpr uint32_t WEIGHT_MODE_TIMEOUT_MS = 60UL * 1000UL;
+static bool scaleSessionReady = false;
+static bool weightStartupPending = false;
+static bool weightStartupScreenShown = false;
 static bool scaleWireReady = false;
 static bool scaleFiltersReady = false;
 static bool scaleFound = false;
@@ -1599,6 +1602,7 @@ static void renderAngry(uint32_t ms) {
 // ---- 重量モード画面 -----------------------------------------------------
 static void renderWeight() {
   AgavWeightView view = {
+      .starting = weightStartupPending,
       .scaleFound = scaleFound,
       .scaleGapOk = scaleGapOk,
       .manualTareActive = manualTareActive,
@@ -1614,26 +1618,43 @@ static void enterWeightMode(uint32_t nowMs) {
   weightMode = true;
   manualTareActive = false;
   weightLastActivityMs = nowMs;
-  initScaleWire();
-  scaleFound = miniScaleProbe();
-  scaleFiltersReady = false;
-  weightTareG = 0.0f;
-  resetWeightState();
-  lastWeightRead = 0;
-  lastWeightLog = 0;
-  if (scaleFound) {
-    restoreScaleFilters();
-    miniScaleTare(false);
+  agavOnWeightModeEnter();
+
+  weightStartupPending = !scaleSessionReady || !agavHasPlants();
+  weightStartupScreenShown = !weightStartupPending;
+  if (!weightStartupPending) {
+    resetWeightState();
     pollWeight(nowMs);
   }
-  agavOnWeightModeEnter();
-  Serial.printf("weight mode -> 1 (scale %s)\n",
-                scaleFound ? "OK" : "NOT FOUND");
+}
+
+static void finishWeightStartup(uint32_t nowMs) {
+  if (!scaleSessionReady) {
+    initScaleWire();
+    scaleFound = miniScaleProbe();
+    scaleFiltersReady = false;
+    weightTareG = 0.0f;
+    resetWeightState();
+    lastWeightRead = 0;
+    lastWeightLog = 0;
+    if (scaleFound) {
+      restoreScaleFilters();
+      miniScaleTare(false);
+      pollWeight(nowMs);
+      scaleSessionReady = scaleFiltersReady && scaleZeroAdc != 0;
+    }
+  }
+  agavLoadPlantsIfNeeded();
+  weightStartupPending = false;
+  Serial.printf("weight mode -> 1 (scale %s, plants %d)\n",
+                scaleFound ? "OK" : "NOT FOUND", agavPlantCount());
 }
 
 static void exitWeightMode() {
   if (!weightMode) return;
   weightMode = false;
+  weightStartupPending = false;
+  weightStartupScreenShown = false;
   manualTareActive = false;
   agavOnWeightModeExit();
   calMode = false;
@@ -1957,6 +1978,18 @@ void loop() {
 
   // 重量モード中は時計の代わりに重量/キャリブ画面を表示
   if (weightMode) {
+    if (weightStartupPending && !weightStartupScreenShown) {
+      lastDraw = ms;
+      renderWeight();
+      weightStartupScreenShown = true;
+      forceDraw = false;
+      delay(1);
+      return;
+    }
+    if (weightStartupPending) {
+      finishWeightStartup(ms);
+      forceDraw = true;
+    }
     if (agavEnabled() && !calMode) agavThumbService();
     if (calMode) {
       if (scaleFound) {
@@ -1976,6 +2009,7 @@ void loop() {
           restoreScaleFilters();
           miniScaleTare(false);
           pollWeight(ms);
+          scaleSessionReady = scaleFiltersReady && scaleZeroAdc != 0;
         }
       } else {
         pollWeight(ms);

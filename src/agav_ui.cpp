@@ -225,12 +225,6 @@ static void renderSelect(M5Canvas &c, const AgavWeightView &view) {
   drawPlantRow(c, cardX, cardY, cardW, cardH, agavSelectedLabel(),
                agavPlantIndex(), agavPlantIndex() + 1, agavPlantCount());
 
-  c.setFont(&fonts::FreeSansBold9pt7b);
-  c.setTextSize(1.0f);
-  c.setTextDatum(top_center);
-  c.setTextColor(AGAV_INK_MUTED, AGAV_BG);
-  c.drawString("< swipe >", W / 2, cardY + cardH + 4);
-
   drawFooter(c, "A: cancel", "B: record", AGAV_BG);
   (void)view;
 }
@@ -241,6 +235,12 @@ static void renderMeasuring(M5Canvas &c, const AgavWeightView &view) {
   c.fillScreen(AGAV_BG);
   drawWatermark(c);
 
+  if (view.starting) {
+    drawScaledCenterText(c, "Starting...", W / 2, H / 2, 28.0f, AGAV_SAND,
+                         AGAV_BG);
+    drawFooter(c, "A: exit", "", AGAV_BG);
+    return;
+  }
   if (!view.scaleFound) {
     drawScaledCenterText(c, "No scale", W / 2, H / 2, 28.0f, AGAV_RUST, AGAV_BG);
     drawFooter(c, "A: exit", "", AGAV_BG);

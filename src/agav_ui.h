@@ -3,6 +3,7 @@
 #include <M5GFX.h>
 
 struct AgavWeightView {
+  bool starting;
   bool scaleFound;
   bool scaleGapOk;
   bool manualTareActive;
