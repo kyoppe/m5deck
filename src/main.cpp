@@ -1,15 +1,23 @@
 #include <M5Unified.h>
 #include <WiFi.h>
+#define ENABLE_LEGACY_EXTRAS 0
+#if ENABLE_LEGACY_EXTRAS
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
-#include <NimBLEDevice.h>  // 心拍モード: Coros等のHRブロードキャスト受信(BLE central)
+#endif
+#include <Wire.h>
 #include <time.h>
 
 #include "secrets.h"
+#include "agavydration.h"
+#include "agav_ui.h"
+#include "agav_thumb.h"
 #include "MujiNum.h"  // 無印 駅の時計用の数字フォント(Jost*)
 #include "Seg7.h"     // デジタル時計用 7セグフォント(DSEG7 Classic Bold)
+#if ENABLE_LEGACY_EXTRAS
 #include "AngryVoice.h"  // 持ち上げ時の怒りボイス(WAV, Kyoko)
+#endif
 
 // ---- 見た目の設定 -------------------------------------------------------
 static constexpr uint16_t COLOR_BG = TFT_BLACK;
@@ -24,12 +32,14 @@ static constexpr uint16_t COLOR_BLACK = TFT_BLACK;
 // 320x240（横向き）に描くためのオフスクリーンキャンバス（ちらつき防止）
 static M5Canvas canvas(&M5.Display);
 
-// ミュートアイコン用の小スプライト（不透明で1度だけ描き、毎フレームαで合成）
+#if ENABLE_LEGACY_EXTRAS
+// Legacy extras: Datadog alert, schedule reminder, movement reaction, and mute.
 static constexpr int MUTE_W = 196;
 static constexpr int MUTE_H = 150;
 static constexpr uint8_t MUTE_ALPHA = 115;  // 0..255（薄め＝約45%）
 static M5Canvas muteSpr(&M5.Display);
 static bool muteSprReady = false;
+#endif
 
 // 時刻文字（HH:MM）のレイアウト（DSEG7 7セグ）
 static float timeScale = 1.0f;
@@ -44,86 +54,601 @@ static bool ntpOk = false;
 // ---- パネル切替 ---------------------------------------------------------
 enum Panel { PANEL_DIGITAL = 0, PANEL_ANALOG = 1, PANEL_COUNT = 2 };
 static int currentPanel = PANEL_DIGITAL;
-static bool showBattery = false;  // ボタンBでトグル：右上にバッテリー残量を表示
 
-// ---- 心拍モード（BLE: Coros等のHRブロードキャストを受信）-----------------
-// ボタンAでON/OFF。Coros側で「心拍数ブロードキャスト」をONにしておくこと。
-static constexpr int HR_MAX = 190;  // 最大心拍(ゾーン計算用)。220-年齢などで各自調整
+// ---- 重量モード（Mini Scales Unit @ I2C 0x26, PORT-A G32/G33）---------
+// ボタンAでON/OFF。重量モード中はBでタレ(ゼロ調整)。
+static constexpr uint8_t MINI_SCALE_ADDR = 0x26;
+static constexpr int SCALE_SDA = 32;
+static constexpr int SCALE_SCL = 33;
+// ユニット内蔵フィルタ (I2C レジスタ)
+static constexpr int SCALE_HW_AVG_LEVEL = 32;
+static constexpr int SCALE_HW_EMA_ALPHA = 12;
+static constexpr float WEIGHT_SW_EMA_ALPHA_UP = 0.38f;
+static constexpr float WEIGHT_SW_EMA_ALPHA_DOWN = 0.10f;
+static constexpr float WEIGHT_SW_EMA_ALPHA_IDLE = 0.06f;
+static constexpr float WEIGHT_DEADBAND_G = 0.5f;
+static constexpr float WEIGHT_IDLE_DEADBAND_G = 1.2f;
+static constexpr float WEIGHT_WIND_IGNORE_G = 3.5f;
+static constexpr float WEIGHT_ZERO_CLAMP_G = 1.2f;
+static constexpr float WEIGHT_DISPLAY_HOLD_G = 0.35f;
+static constexpr uint32_t WEIGHT_DISPLAY_HOLD_MS = 180;
+static constexpr float WEIGHT_DISPLAY_SNAP_G = 5.0f;
+// 空載判定 (ヒステリシス + 安定時間。載せ途中の値をゼロ扱いしない)
+static constexpr float WEIGHT_EMPTY_G = 1.5f;
+static constexpr float WEIGHT_LOADED_G = 4.0f;
+static constexpr uint32_t WEIGHT_EMPTY_HOLD_MS = 700;
 
-enum HrState { HRS_IDLE = 0, HRS_SCAN, HRS_CONNECTING, HRS_CONNECTED };
-static volatile bool hrMode = false;
-static volatile HrState hrState = HRS_IDLE;
-static volatile int hrBpm = 0;
-static volatile uint32_t hrLastData = 0;
-static NimBLEAddress hrAddr;
-static volatile bool hrHasAddr = false;
-static volatile bool hrNeedScan = false;
-static NimBLEClient *hrClient = nullptr;
-static bool bleInited = false;
+enum WeightLoadState { WLS_IDLE = 0, WLS_LOADED = 1 };
+static WeightLoadState weightLoadState = WLS_IDLE;
+static uint32_t emptyStableSinceMs = 0;
 
-// 心拍計測キャラクタリスティック(0x2A37)の通知。先頭フラグでbpmが8/16bitか決まる。
-static void hrNotifyCB(NimBLERemoteCharacteristic *chr, uint8_t *data,
-                       size_t len, bool isNotify) {
-  if (len < 2) return;
-  const uint8_t flags = data[0];
-  const int bpm = (flags & 0x01) ? (data[1] | (data[2] << 8)) : data[1];
-  if (bpm > 0 && bpm < 250) {
-    hrBpm = bpm;
-    hrLastData = millis();
+static bool weightMode = false;
+static bool manualTareActive = false;
+static uint32_t weightLastActivityMs = 0;
+static constexpr uint32_t WEIGHT_MODE_TIMEOUT_MS = 60UL * 1000UL;
+static bool scaleWireReady = false;
+static bool scaleFiltersReady = false;
+static bool scaleFound = false;
+static float weightTareG = 0.0f;
+static float weightRawG = 0.0f;
+static float weightGrams = 0.0f;  // 表示用 (フィルタ後)
+static uint32_t weightAdc = 0;
+static uint32_t lastWeightRead = 0;
+static uint32_t lastWeightLog = 0;
+static float weightEma = 0.0f;
+static bool weightEmaInit = false;
+static float scaleGap = 0.0f;
+static bool scaleGapOk = false;
+static int32_t scaleZeroAdc = 0;
+static float weightUnitG = 0.0f;
+static float weightDisplayG = 0.0f;
+static uint32_t weightDisplayHoldMs = 0;
+static char weightHint[48] = "";
+
+static int32_t miniScaleAdcU32ToS32(uint32_t adc) {
+  int32_t v;
+  memcpy(&v, &adc, sizeof(v));
+  return v;
+}
+
+static bool miniScaleReadGap(float *gapOut);
+static bool miniScaleResetOffset();
+
+static void initScaleWire() {
+  if (scaleWireReady) return;
+  Wire.begin(SCALE_SDA, SCALE_SCL);
+  Wire.setClock(400000);
+  scaleWireReady = true;
+}
+
+static bool miniScaleWriteReg(uint8_t reg, const uint8_t *data, size_t len) {
+  Wire.beginTransmission(MINI_SCALE_ADDR);
+  Wire.write(reg);
+  for (size_t i = 0; i < len; i++) Wire.write(data[i]);
+  return Wire.endTransmission() == 0;
+}
+
+static void initScaleFilters() {
+  if (!scaleFound) return;
+  if (scaleFiltersReady) return;
+  const uint8_t lpfOn = 0x01;
+  const uint8_t avgLevel = (uint8_t)SCALE_HW_AVG_LEVEL;
+  const uint8_t emaAlpha = (uint8_t)SCALE_HW_EMA_ALPHA;
+  const bool ok = miniScaleWriteReg(0x80, &lpfOn, 1) &&
+                  miniScaleWriteReg(0x81, (const uint8_t *)&avgLevel, 1) &&
+                  miniScaleWriteReg(0x82, (const uint8_t *)&emaAlpha, 1);
+  scaleFiltersReady = ok;
+  Serial.printf("scale filters -> %s (lpf=on avg=%d ema=%d)\n", ok ? "OK" : "FAIL",
+                SCALE_HW_AVG_LEVEL, SCALE_HW_EMA_ALPHA);
+}
+
+static void resetWeightFilter() {
+  weightEmaInit = false;
+  weightGrams = 0.0f;
+}
+
+static void resetWeightState() {
+  resetWeightFilter();
+  weightLoadState = WLS_IDLE;
+  emptyStableSinceMs = 0;
+}
+
+static void updateWeightLoadState(float rawG, uint32_t nowMs) {
+  if (rawG >= WEIGHT_LOADED_G) {
+    weightLoadState = WLS_LOADED;
+    emptyStableSinceMs = 0;
+    return;
+  }
+  if (rawG < WEIGHT_EMPTY_G) {
+    if (emptyStableSinceMs == 0) emptyStableSinceMs = nowMs;
+    if (weightLoadState == WLS_LOADED &&
+        nowMs - emptyStableSinceMs >= WEIGHT_EMPTY_HOLD_MS) {
+      weightLoadState = WLS_IDLE;
+    }
+    return;
+  }
+  // 3..6 g のヒステリシス帯: 状態維持、空載タイマーリセット
+  emptyStableSinceMs = 0;
+}
+
+static bool weightEmptyStable(float rawG, uint32_t nowMs) {
+  if (weightLoadState != WLS_IDLE) return false;
+  if (fabsf(rawG) >= WEIGHT_EMPTY_G) return false;
+  if (emptyStableSinceMs == 0) return false;
+  return (nowMs - emptyStableSinceMs) >= WEIGHT_EMPTY_HOLD_MS;
+}
+
+static float applyWeightFilter(float rawG, bool snapZero) {
+  // 空載が安定したときだけ 0 表示 (載荷中はフィルタ遅延でもゼロにしない)
+  if (snapZero) {
+    weightEma = 0.0f;
+    weightGrams = 0.0f;
+    weightEmaInit = true;
+    return 0.0f;
+  }
+  if (!weightEmaInit) {
+    weightEma = rawG;
+    weightGrams = rawG;
+    weightEmaInit = true;
+    return weightGrams;
+  }
+  float filterIn = rawG;
+  if (weightLoadState == WLS_IDLE && fabsf(rawG) < WEIGHT_WIND_IGNORE_G) {
+    filterIn = 0.0f;
+  }
+  float alpha;
+  if (weightLoadState == WLS_IDLE) {
+    alpha = WEIGHT_SW_EMA_ALPHA_IDLE;
+  } else {
+    alpha = (fabsf(filterIn) > fabsf(weightEma)) ? WEIGHT_SW_EMA_ALPHA_UP
+                                                : WEIGHT_SW_EMA_ALPHA_DOWN;
+  }
+  weightEma += alpha * (filterIn - weightEma);
+  if (weightLoadState == WLS_LOADED && fabsf(rawG - weightEma) > 8.0f) {
+    weightEma = rawG;
+  }
+  const float deadband =
+      (weightLoadState == WLS_IDLE) ? WEIGHT_IDLE_DEADBAND_G : WEIGHT_DEADBAND_G;
+  if (fabsf(weightEma - weightGrams) >= deadband) {
+    weightGrams = weightEma;
+  }
+  return weightGrams;
+}
+
+static bool miniScaleProbe() {
+  Wire.beginTransmission(MINI_SCALE_ADDR);
+  return Wire.endTransmission() == 0;
+}
+
+static bool miniScaleGapSane(float gap) {
+  if (!isfinite(gap)) return false;
+  const float a = fabsf(gap);
+  return a >= 100.0f && a <= 1000000.0f;
+}
+
+static void refreshScaleGap() {
+  float gap = 0.0f;
+  scaleGapOk = miniScaleReadGap(&gap) && miniScaleGapSane(gap);
+  if (scaleGapOk) scaleGap = gap;
+}
+
+static float miniScaleGramsFromAdcDelta(int32_t adcDelta) {
+  if (!scaleGapOk || scaleGap == 0.0f) return 0.0f;
+  return (float)adcDelta / scaleGap;
+}
+
+static bool miniScaleReadRaw(uint32_t *adcOut, float *gramsOut);
+
+static bool miniScaleCaptureZeroAdc(int32_t *adcOut, int samples = 12) {
+  int64_t sum = 0;
+  for (int i = 0; i < samples; i++) {
+    uint32_t adcU = 0;
+    float g = 0.0f;
+    if (!miniScaleReadRaw(&adcU, &g)) return false;
+    sum += miniScaleAdcU32ToS32(adcU);
+    delay(40);
+  }
+  *adcOut = (int32_t)(sum / samples);
+  return true;
+}
+
+static bool miniScaleReadRaw(uint32_t *adcOut, float *gramsOut) {
+  uint8_t buf[4];
+
+  Wire.beginTransmission(MINI_SCALE_ADDR);
+  Wire.write(0x10);
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom((int)MINI_SCALE_ADDR, 4) != 4) return false;
+  for (int i = 0; i < 4; i++) buf[i] = Wire.read();
+  float grams;
+  memcpy(&grams, buf, sizeof(grams));
+
+  Wire.beginTransmission(MINI_SCALE_ADDR);
+  Wire.write(0x00);
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom((int)MINI_SCALE_ADDR, 4) != 4) return false;
+  for (int i = 0; i < 4; i++) buf[i] = Wire.read();
+  uint32_t adc;
+  memcpy(&adc, buf, sizeof(adc));
+
+  if (adcOut) *adcOut = adc;
+  if (gramsOut) *gramsOut = grams;
+  return true;
+}
+
+static void restoreScaleFilters() {
+  scaleFiltersReady = false;
+  initScaleFilters();
+  if (!scaleFound) return;
+  for (int i = 0; i < 12; i++) {
+    uint32_t adc = 0;
+    float g = 0.0f;
+    miniScaleReadRaw(&adc, &g);
+    delay(50);
   }
 }
 
-// スキャンで HR Service(0x180D) を広告している端末を見つけたらアドレスを保持。
-class HrScanCallbacks : public NimBLEScanCallbacks {
-  void onResult(const NimBLEAdvertisedDevice *dev) override {
-    if (hrState != HRS_SCAN || hrHasAddr) return;
-    if (dev->isAdvertisingService(NimBLEUUID((uint16_t)0x180D))) {
-      hrAddr = dev->getAddress();
-      hrHasAddr = true;
-      NimBLEDevice::getScan()->stop();
-      Serial.printf("HR device found: %s\n", hrAddr.toString().c_str());
-    }
+static bool pollWeight(uint32_t nowMs) {
+  float unitGrams = 0.0f;
+  uint32_t adcU = 0;
+  if (!miniScaleReadRaw(&adcU, &unitGrams)) {
+    scaleFound = false;
+    scaleFiltersReady = false;
+    snprintf(weightHint, sizeof(weightHint), "I2C read fail");
+    return false;
   }
-};
-static HrScanCallbacks hrScanCallbacks;
+  if (!isfinite(unitGrams)) return false;
+  if (!scaleFiltersReady) initScaleFilters();
+  refreshScaleGap();
+  weightAdc = adcU;
+  weightUnitG = unitGrams;
+  const int32_t adcS = miniScaleAdcU32ToS32(adcU);
 
-class HrClientCallbacks : public NimBLEClientCallbacks {
-  void onDisconnect(NimBLEClient *c, int reason) override {
-    Serial.printf("HR disconnected (reason %d)\n", reason);
-    hrBpm = 0;
-    if (hrMode) {  // モード継続中なら再スキャンへ
-      hrState = HRS_SCAN;
-      hrHasAddr = false;
-      hrNeedScan = true;
-    }
+  weightHint[0] = '\0';
+  if (!scaleGapOk) {
+    snprintf(weightHint, sizeof(weightHint), "GAP未設定 B長:キャリブ");
+    weightRawG = 0.0f;
+    weightGrams = 0.0f;
+    weightEmaInit = false;
+    return true;
   }
-};
-static HrClientCallbacks hrClientCallbacks;
 
-static bool hrConnect() {
-  if (!hrClient) {
-    hrClient = NimBLEDevice::createClient();
-    hrClient->setClientCallbacks(&hrClientCallbacks, false);
-  }
-  if (!hrClient->connect(hrAddr)) return false;
-  NimBLERemoteService *svc = hrClient->getService(NimBLEUUID((uint16_t)0x180D));
-  if (!svc) {
-    hrClient->disconnect();
-    return false;
-  }
-  NimBLERemoteCharacteristic *chr =
-      svc->getCharacteristic(NimBLEUUID((uint16_t)0x2A37));
-  if (!chr) {
-    hrClient->disconnect();
-    return false;
-  }
-  if (chr->canNotify() && !chr->subscribe(true, hrNotifyCB)) {
-    hrClient->disconnect();
-    return false;
+  const int32_t adcDelta = adcS - scaleZeroAdc;
+  weightRawG = miniScaleGramsFromAdcDelta(adcDelta);
+  updateWeightLoadState(weightRawG, nowMs);
+  applyWeightFilter(weightRawG, false);
+  if (fabsf(weightGrams) < WEIGHT_ZERO_CLAMP_G) weightGrams = 0.0f;
+
+  const float rounded = roundf(weightGrams * 10.0f) / 10.0f;
+  const float dispDelta = fabsf(rounded - weightDisplayG);
+  if (dispDelta >= WEIGHT_DISPLAY_SNAP_G || dispDelta < 0.05f) {
+    weightDisplayG = rounded;
+    weightDisplayHoldMs = 0;
+  } else if (dispDelta <= WEIGHT_DISPLAY_HOLD_G) {
+    if (weightDisplayHoldMs == 0) weightDisplayHoldMs = nowMs;
+    if (nowMs - weightDisplayHoldMs >= WEIGHT_DISPLAY_HOLD_MS) {
+      weightDisplayG = rounded;
+    }
+  } else {
+    weightDisplayG = rounded;
+    weightDisplayHoldMs = 0;
   }
   return true;
 }
 
+static void miniScaleTare(bool manual = false) {
+  if (!scaleFound) return;
+  if (!miniScaleCaptureZeroAdc(&scaleZeroAdc)) return;
+  manualTareActive = manual;
+  weightTareG = 0.0f;
+  resetWeightState();
+  weightDisplayG = 0.0f;
+  weightDisplayHoldMs = 0;
+  refreshScaleGap();
+  Serial.printf("scale tare -> zero_adc=%ld gap=%.1f\n", (long)scaleZeroAdc,
+                scaleGap);
+}
+
+// ---- キャリブレーション (10円硬貨・GAP はユニット内 Flash) ---------------
+static constexpr int CAL_10YEN_COUNT = 10;      // 10円10枚 = 45.0g
+static constexpr float CAL_10YEN_ONE_G = 4.5f;
+static constexpr float CAL_REF_GRAMS = CAL_10YEN_ONE_G * CAL_10YEN_COUNT;
+static constexpr int32_t CAL_MIN_ADC_DELTA = 80;  // 載荷でこれ未満なら失敗
+
+enum CalStep {
+  CAL_EMPTY = 0,
+  CAL_LOAD,
+  CAL_DONE,
+  CAL_FAIL,
+};
+
+static bool calMode = false;
+static CalStep calStep = CAL_EMPTY;
+static uint32_t calAdcEmpty = 0;
+static uint32_t calAdcLoad = 0;
+static float calGramsEmpty = 0.0f;
+static float calGramsLoad = 0.0f;
+static float calGapWritten = 0.0f;
+static float calVerifyG = 0.0f;
+static int32_t calLiveAdc = 0;
+static float calLiveG = 0.0f;
+static char calMsg[72] = "";
+
+static void disableScaleFiltersForCal() {
+  const uint8_t off = 0;
+  const int8_t zero = 0;
+  miniScaleWriteReg(0x80, &off, 1);
+  miniScaleWriteReg(0x81, (const uint8_t *)&zero, 1);
+  miniScaleWriteReg(0x82, (const uint8_t *)&zero, 1);
+  scaleFiltersReady = false;
+}
+
+static bool miniScaleReadSampleAvg(int32_t *adcOut, float *gramsOut,
+                                   int samples = 16) {
+  if (!scaleFiltersReady) initScaleFilters();
+  int64_t adcSum = 0;
+  float gSum = 0.0f;
+  bool ok = true;
+  for (int i = 0; i < samples; i++) {
+    uint32_t adcU = 0;
+    float g = 0.0f;
+    if (!miniScaleReadRaw(&adcU, &g)) {
+      ok = false;
+      break;
+    }
+    adcSum += miniScaleAdcU32ToS32(adcU);
+    gSum += g;
+    delay(40);
+  }
+  if (!ok) return false;
+  *adcOut = (int32_t)(adcSum / samples);
+  *gramsOut = gSum / (float)samples;
+  return true;
+}
+
+static bool miniScaleResetOffset() {
+  const uint8_t one = 0x01;
+  return miniScaleWriteReg(0x50, &one, 1);
+}
+
+static bool miniScaleReadGap(float *gapOut) {
+  Wire.beginTransmission(MINI_SCALE_ADDR);
+  Wire.write(0x40);
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom((int)MINI_SCALE_ADDR, 4) != 4) return false;
+  uint8_t buf[4];
+  for (int i = 0; i < 4; i++) buf[i] = Wire.read();
+  memcpy(gapOut, buf, sizeof(float));
+  return true;
+}
+
+static bool miniScaleWriteGap(float gap) {
+  const bool ok = miniScaleWriteReg(0x40, (const uint8_t *)&gap, sizeof(gap));
+  delay(100);
+  return ok;
+}
+
+static void enterCalMode() {
+  calMode = true;
+  calStep = CAL_EMPTY;
+  calMsg[0] = '\0';
+  initScaleWire();
+  scaleFound = miniScaleProbe();
+  if (scaleFound) restoreScaleFilters();
+}
+
+static void calFail(const char *msg) {
+  calStep = CAL_FAIL;
+  snprintf(calMsg, sizeof(calMsg), "%s", msg);
+  if (scaleFound) restoreScaleFilters();
+}
+
+static void exitCalMode() {
+  calMode = false;
+  weightTareG = 0.0f;
+  resetWeightState();
+  if (scaleFound) {
+    restoreScaleFilters();
+    miniScaleTare();
+  }
+}
+
+static void handleCalButtonA() {
+  switch (calStep) {
+    case CAL_EMPTY:
+      if (!scaleFound) {
+        calFail("Mini Scale not found");
+        break;
+      }
+      if (!miniScaleReadSampleAvg(&calLiveAdc, &calGramsEmpty)) {
+        calFail("空載の読取失敗");
+        break;
+      }
+      calAdcEmpty = (uint32_t)calLiveAdc;
+      calStep = CAL_LOAD;
+      break;
+    case CAL_LOAD: {
+      int32_t adcLoad = 0;
+      if (!miniScaleReadSampleAvg(&adcLoad, &calGramsLoad)) {
+        calFail("載荷の読取失敗");
+        break;
+      }
+      calAdcLoad = (uint32_t)adcLoad;
+      const float knownG = CAL_REF_GRAMS;
+      const int32_t adcEmptyS = miniScaleAdcU32ToS32(calAdcEmpty);
+      const int32_t adcDelta = adcLoad - adcEmptyS;
+      const int32_t adcAbs =
+          adcDelta < 0 ? -adcDelta : adcDelta;
+      const float gramDelta = calGramsLoad - calGramsEmpty;
+      const float gramAbs = fabsf(gramDelta);
+
+      float gap = 0.0f;
+      if (knownG <= 0.0f) {
+        calFail("硬貨設定が不正");
+        break;
+      }
+      if (adcAbs >= CAL_MIN_ADC_DELTA) {
+        gap = (float)adcDelta / knownG;
+      } else {
+        char detail[72];
+        snprintf(detail, sizeof(detail), "変化小 dADC=%ld dG=%.1f",
+                 (long)adcDelta, gramDelta);
+        calFail(detail);
+        break;
+      }
+      {
+        const float verifyG = (float)adcDelta / gap;
+        if (fabsf(verifyG) < knownG * 0.7f || fabsf(verifyG) > knownG * 1.3f) {
+          char detail[72];
+          snprintf(detail, sizeof(detail), "載荷%.1fg 想定%.1fg", verifyG,
+                   knownG);
+          calFail(detail);
+          break;
+        }
+      }
+      if (gap == 0.0f || !isfinite(gap)) {
+        calFail("GAP計算が不正");
+        break;
+      }
+      if (!miniScaleWriteGap(gap)) {
+        calFail("GAP書込失敗");
+        break;
+      }
+      if (!miniScaleGapSane(gap)) {
+        calFail("GAP値が不正");
+        break;
+      }
+      calGapWritten = gap;
+      scaleGap = gap;
+      scaleGapOk = true;
+      scaleZeroAdc = adcEmptyS;
+      calVerifyG = (float)adcDelta / gap;
+      calStep = CAL_DONE;
+      break;
+    }
+    case CAL_DONE: {
+      uint32_t adcU = 0;
+      float g = 0.0f;
+      if (!miniScaleReadRaw(&adcU, &g)) {
+        calFail("読取失敗");
+        break;
+      }
+      const int32_t adcS = miniScaleAdcU32ToS32(adcU);
+      const int32_t emptyS = miniScaleAdcU32ToS32(calAdcEmpty);
+      const int32_t dAbs = adcS - emptyS;
+      const int32_t dLoad = miniScaleAdcU32ToS32(calAdcLoad) - emptyS;
+      const int32_t rem = dAbs < 0 ? -dAbs : dAbs;
+      const int32_t loadAbs = dLoad < 0 ? -dLoad : dLoad;
+      if (rem > loadAbs / 4) {
+        calFail("硬貨を外してA");
+        break;
+      }
+      scaleZeroAdc = adcS;
+      exitCalMode();
+      break;
+    }
+    case CAL_FAIL:
+      calStep = CAL_LOAD;  // Aで手順2から再試行
+      break;
+  }
+}
+
+static void renderCal() {
+  const uint16_t bg = lgfx::color565(18, 14, 8);
+  canvas.fillScreen(bg);
+  const int W = canvas.width();
+  const int H = canvas.height();
+  const uint16_t titleCol = lgfx::color565(255, 210, 80);
+  const uint16_t textCol = lgfx::color565(220, 220, 230);
+  const uint16_t dimCol = lgfx::color565(140, 140, 155);
+
+  canvas.setFont(&fonts::lgfxJapanGothicP_16);
+  canvas.setTextDatum(top_center);
+  canvas.setTextColor(titleCol, bg);
+  canvas.drawString("CALIBRATION", W / 2, 8);
+
+  canvas.setTextColor(dimCol, bg);
+  {
+    char refLine[40];
+    snprintf(refLine, sizeof(refLine), "10yen x%d (%.1fg)", CAL_10YEN_COUNT,
+             CAL_REF_GRAMS);
+    canvas.drawString(refLine, W / 2, 26);
+  }
+
+  canvas.setTextColor(textCol, bg);
+  int y = 48;
+  const int lineH = 20;
+
+  switch (calStep) {
+    case CAL_EMPTY:
+      canvas.drawString("手順1/2: 空載", W / 2, y);
+      y += lineH + 6;
+      canvas.setTextColor(dimCol, bg);
+      canvas.drawString("何も載せない", W / 2, y);
+      y += lineH;
+      canvas.drawString("Aでゼロ点取得", W / 2, y);
+      y += lineH;
+      {
+        char live[40];
+        snprintf(live, sizeof(live), "now %.1fg", calLiveG);
+        canvas.drawString(live, W / 2, y);
+      }
+      break;
+    case CAL_LOAD: {
+      char loadLine[48];
+      snprintf(loadLine, sizeof(loadLine), "Step2: 10yen x%d", CAL_10YEN_COUNT);
+      canvas.drawString(loadLine, W / 2, y);
+      y += lineH + 6;
+      canvas.setTextColor(dimCol, bg);
+      canvas.drawString("載せて2秒待ってからA", W / 2, y);
+      y += lineH;
+      canvas.drawString("(10枚・中央に)", W / 2, y);
+      y += lineH;
+      {
+        char live[56];
+        snprintf(live, sizeof(live), "now %.1fg (+%.1f) adc %ld",
+                 calLiveG, calLiveG - calGramsEmpty, (long)calLiveAdc);
+        canvas.drawString(live, W / 2, y);
+      }
+      break;
+    }
+    case CAL_DONE: {
+      char result[48];
+      snprintf(result, sizeof(result), "target %.1fg / now %.1fg", CAL_REF_GRAMS,
+               calVerifyG);
+      canvas.drawString("完了", W / 2, y);
+      y += lineH + 6;
+      canvas.setTextColor(dimCol, bg);
+      canvas.drawString(result, W / 2, y);
+      y += lineH;
+      canvas.drawString("Mini Scalesに保存済み", W / 2, y);
+      y += lineH;
+      canvas.drawString("硬貨を外してA", W / 2, y);
+      break;
+    }
+    case CAL_FAIL:
+      canvas.setTextColor(lgfx::color565(230, 20, 20), bg);
+      canvas.drawString("失敗", W / 2, y);
+      y += lineH + 6;
+      canvas.setTextColor(dimCol, bg);
+      canvas.drawString(calMsg[0] ? calMsg : "不明なエラー", W / 2, y);
+      break;
+  }
+
+  canvas.setTextColor(dimCol, bg);
+  canvas.setTextDatum(bottom_left);
+  if (calStep == CAL_DONE || calStep == CAL_FAIL) {
+    canvas.drawString("A:back", 8, H - 6);
+  } else {
+    canvas.drawString("A:next", 8, H - 6);
+  }
+  canvas.setTextDatum(bottom_right);
+  canvas.drawString("C:中止", W - 8, H - 6);
+
+  canvas.pushSprite(0, 0);
+}
+
+#if ENABLE_LEGACY_EXTRAS
 // ---- Datadog アラート ---------------------------------------------------
 // ポーリングは別タスク(core0)で実行し、メインループ(core1)を止めない。
 // ホットパスはスカラ値(volatile)で読み、表示用の String だけ mutex で保護する。
@@ -162,6 +687,7 @@ static constexpr int CLR_H = 30;
 static inline bool sirenActive() {
   return gAlertActive && alertSeq > alertAckedSeq;
 }
+#endif
 
 // ---- 時刻ソース ---------------------------------------------------------
 static void systemTimeFromRtc() {
@@ -266,6 +792,7 @@ static void computeLayout() {
 
 // 未解決アラートがあるとき、時計の右上に点滅する赤いバッジを重ねる。
 // タップでハブ（QR）に戻れることを示す痕跡。
+#if ENABLE_LEGACY_EXTRAS
 static void drawAlertBadge() {
   if (!gAlertActive) return;
   const int n = alertCount;
@@ -284,11 +811,11 @@ static void drawAlertBadge() {
   canvas.setFont(&fonts::Font2);
   canvas.drawString(buf, x + w / 2, y + h / 2);
 }
+#endif
 
-// 右上のバッテリー残量（ボタンBでトグル表示）。アイコン＋%、充電中は稲妻。
+// 右上のバッテリー残量。アイコン＋%、充電中は稲妻。
 // パネルのテイストに合わせて配色を切替（デジタル=ダーク調/緑黄赤、アナログ=白地に黒のミニマル）。
 static void drawBatteryOverlay() {
-  if (!showBattery) return;
   int level = M5.Power.getBatteryLevel();  // 0-100
   if (level < 0) level = 0;
   if (level > 100) level = 100;
@@ -339,6 +866,7 @@ static void drawBatteryOverlay() {
 
 // ミュートアイコン（スピーカー＋音波＋斜線）を小スプライトに不透明で1度だけ描く。
 // 背景キーは黒(0)。アイコンは明るいグレーで描く。
+#if ENABLE_LEGACY_EXTRAS
 static void buildMuteSprite() {
   muteSpr.setColorDepth(16);
   muteSpr.setPsram(true);
@@ -395,6 +923,7 @@ static void drawMuteOverlay() {
     }
   }
 }
+#endif
 
 // ---- デジタル時計パネル -------------------------------------------------
 static void renderDigital(const struct tm &tm, bool colonOn) {
@@ -435,8 +964,6 @@ static void renderDigital(const struct tm &tm, bool colonOn) {
   canvas.fillCircle(8, 10, 4, dot);
 
   drawBatteryOverlay();
-  drawAlertBadge();
-  drawMuteOverlay();
   canvas.pushSprite(0, 0);
 }
 
@@ -531,12 +1058,11 @@ static void renderAnalog(const struct tm &tm) {
   canvas.fillCircle(cx, cy, 7, COLOR_BLACK);
 
   drawBatteryOverlay();
-  drawAlertBadge();
-  drawMuteOverlay();
   canvas.pushSprite(0, 0);
 }
 
 // ---- アラート通信 -------------------------------------------------------
+#if ENABLE_LEGACY_EXTRAS
 static void pollAlert() {
   if (WiFi.status() != WL_CONNECTED) return;
   WiFiClientSecure client;
@@ -1068,143 +1594,57 @@ static void renderAngry(uint32_t ms) {
   drawMuteOverlay();
   canvas.pushSprite(0, 0);
 }
+#endif
 
-// ---- 心拍モード画面 -----------------------------------------------------
-static void drawHeart(int cx, int cy, int r, uint16_t col) {
-  canvas.fillCircle(cx - r / 2, cy - r / 5, (r * 6) / 10, col);
-  canvas.fillCircle(cx + r / 2, cy - r / 5, (r * 6) / 10, col);
-  canvas.fillTriangle(cx - r, cy, cx + r, cy, cx, cy + (r * 13) / 10, col);
-}
-
-// 最大心拍に対する割合でゾーン(0..5)と色を返す。
-static uint16_t hrZoneColor(int bpm, int *zoneOut) {
-  const int pct = (bpm <= 0) ? 0 : bpm * 100 / HR_MAX;
-  int z;
-  uint16_t c;
-  if (pct < 50) {
-    z = 0;
-    c = lgfx::color565(120, 130, 150);
-  } else if (pct < 60) {
-    z = 1;
-    c = lgfx::color565(70, 160, 255);
-  } else if (pct < 70) {
-    z = 2;
-    c = lgfx::color565(0, 220, 90);
-  } else if (pct < 80) {
-    z = 3;
-    c = lgfx::color565(240, 210, 40);
-  } else if (pct < 90) {
-    z = 4;
-    c = lgfx::color565(255, 140, 0);
-  } else {
-    z = 5;
-    c = lgfx::color565(240, 40, 40);
-  }
-  if (zoneOut) *zoneOut = z;
-  return c;
-}
-
-static void renderHr(uint32_t ms) {
-  const uint16_t bg = lgfx::color565(12, 12, 16);
-  canvas.fillScreen(bg);
-  const int W = canvas.width();
-  const int H = canvas.height();
-
-  const bool connected = (hrState == HRS_CONNECTED);
-  const bool hasData = connected && (ms - hrLastData < 5000) && hrBpm > 0;
-
-  // ステータス行
-  canvas.setTextDatum(top_center);
-  canvas.setFont(&fonts::lgfxJapanGothicP_16);
-  canvas.setTextColor(lgfx::color565(180, 180, 195), bg);
-  const char *status = (hrState == HRS_SCAN)         ? "心拍センサーを探索中..."
-                       : (hrState == HRS_CONNECTING) ? "接続中..."
-                       : (connected && !hasData)     ? "接続済み（データ待ち）"
-                                                     : "HEART RATE";
-  canvas.drawString(status, W / 2, 10);
-
-  int zone = 0;
-  const uint16_t zcol = hrZoneColor(hasData ? hrBpm : 0, &zone);
-
-  // ---- レイアウト領域（320x240 固定）----
-  // 上: ステータス(0..30) / 中: メイン(30..208) / 下: ゾーン・操作(208..240)
-  const int yMid = 106;           // メイン領域の縦中心（bpm/ゾーンの余白を確保）
-  const int heartR = 22;          // ハート基準半径（脈動で最大 +9）
-  const int gap = 28;             // ハートと数値の間隔
-
-  char buf[8];
-  if (hasData) snprintf(buf, sizeof(buf), "%d", hrBpm);
-  else snprintf(buf, sizeof(buf), "--");
-
-  // 数値の高さを ~124px に正規化（実測ベース。桁数で幅が溢れる場合は幅で頭打ち）
-  canvas.setFont(&Seg7);
-  canvas.setTextSize(1.0f);
-  const int baseH = canvas.fontHeight();
-  float numScale = 124.0f / (float)baseH;
-  canvas.setTextSize(numScale);
-  int numW = canvas.textWidth(buf);
-  const int maxGroupW = W - 12;
-  if (heartR * 2 + gap + numW > maxGroupW) {  // 幅オーバーなら数値を縮小
-    numScale *= (float)(maxGroupW - heartR * 2 - gap) / (float)numW;
-    canvas.setTextSize(numScale);
-    numW = canvas.textWidth(buf);
-  }
-  const int numH = canvas.fontHeight();  // 実際の数値高さ（bpm位置の基準）
-
-  // 「ハート＋数値」を1グループとして横中央に配置
-  const int groupW = heartR * 2 + gap + numW;
-  const int groupX = (W - groupW) / 2;
-  const int heartCx = groupX + heartR;
-  const int numCx = groupX + heartR * 2 + gap + numW / 2;
-
-  // 大きな BPM 数値（7セグ・縦中心 yMid）
-  canvas.setTextDatum(middle_center);
-  canvas.setTextColor(hasData ? zcol : lgfx::color565(70, 70, 80), bg);
-  canvas.drawString(buf, numCx, yMid);
-
-  // 脈動ハート（数値の左に、縦位置を合わせて）
-  int beatR = heartR;
-  if (hasData) {
-    const float period = 60000.0f / hrBpm;               // 1拍(ms)
-    const float ph = fmodf((float)ms, period) / period;  // 0..1
-    const float env = expf(-ph * 4.0f);                  // 立ち上がりで“ドクン”
-    beatR = heartR + (int)(env * 9);
-  }
-  const uint16_t heartCol =
-      hasData ? lgfx::color565(235, 45, 65) : lgfx::color565(90, 90, 100);
-  drawHeart(heartCx, yMid, beatR, heartCol);
-
-  // bpm ラベル（数値の下端＋4px・中央。ゾーンと重ならない位置に実測で配置）
-  canvas.setFont(&fonts::Font2);
-  canvas.setTextSize(1.0f);
-  canvas.setTextColor(lgfx::color565(150, 150, 160), bg);
-  canvas.setTextDatum(top_center);
-  canvas.drawString("bpm", numCx, yMid + numH / 2 + 4);
-
-  // ゾーン（最下部・中央）
-  if (hasData) {
-    char zb[16];
-    snprintf(zb, sizeof(zb), "Z%d   %d%%", zone, hrBpm * 100 / HR_MAX);
-    canvas.setFont(&fonts::FreeSansBold12pt7b);
-    canvas.setTextColor(zcol, bg);
-    canvas.setTextDatum(bottom_center);
-    canvas.drawString(zb, W / 2, H - 6);
-  }
-
-  // 操作ヒント
-  canvas.setFont(&fonts::Font2);
-  canvas.setTextSize(1.0f);
-  canvas.setTextColor(lgfx::color565(110, 110, 120), bg);
-  canvas.setTextDatum(bottom_left);
-  canvas.drawString("A: 終了", 8, H - 6);
-
-  drawMuteOverlay();
+// ---- 重量モード画面 -----------------------------------------------------
+static void renderWeight() {
+  AgavWeightView view = {
+      .scaleFound = scaleFound,
+      .scaleGapOk = scaleGapOk,
+      .manualTareActive = manualTareActive,
+      .liveWeightG = weightDisplayG,
+      .weightHint = weightHint,
+  };
+  agavRenderWeightScreen(canvas, view, millis());
   canvas.pushSprite(0, 0);
+}
+
+static void enterWeightMode(uint32_t nowMs) {
+  if (weightMode) return;
+  weightMode = true;
+  manualTareActive = false;
+  weightLastActivityMs = nowMs;
+  initScaleWire();
+  scaleFound = miniScaleProbe();
+  scaleFiltersReady = false;
+  weightTareG = 0.0f;
+  resetWeightState();
+  lastWeightRead = 0;
+  lastWeightLog = 0;
+  if (scaleFound) {
+    restoreScaleFilters();
+    miniScaleTare(false);
+    pollWeight(nowMs);
+  }
+  agavOnWeightModeEnter();
+  Serial.printf("weight mode -> 1 (scale %s)\n",
+                scaleFound ? "OK" : "NOT FOUND");
+}
+
+static void exitWeightMode() {
+  if (!weightMode) return;
+  weightMode = false;
+  manualTareActive = false;
+  agavOnWeightModeExit();
+  calMode = false;
+  Serial.println("weight mode -> 0");
 }
 
 void setup() {
   auto cfg = M5.config();
   M5.begin(cfg);
+
+  M5.BtnB.setHoldThresh(800);  // 長押しでキャリブレーション画面へ
 
   M5.Display.setRotation(1);
   M5.Display.setBrightness(110);
@@ -1217,19 +1657,14 @@ void setup() {
   canvas.setPsram(true);
   canvas.createSprite(M5.Display.width(), M5.Display.height());
 
-  M5.Speaker.setVolume(220);
-
-  if (!M5.Imu.isEnabled()) {
-    if (M5.Imu.begin()) Serial.println("IMU enabled");
-    else Serial.println("IMU not found");
-  }
-
   computeLayout();
   syncTime();
 
+#if ENABLE_LEGACY_EXTRAS
   // ポーリングは別タスク(core0)で常時実行。メインループ(core1)は止めない。
   alertMux = xSemaphoreCreateMutex();
   xTaskCreatePinnedToCore(alertTask, "alert", 16384, nullptr, 1, nullptr, 0);
+#endif
 }
 
 void loop() {
@@ -1242,6 +1677,7 @@ void loop() {
 
   const uint32_t ms = millis();
 
+#if ENABLE_LEGACY_EXTRAS
   // 新しい発報 or 復旧でハブの「閉じた」状態をリセット（状態はタスクが更新）
   static long prevSeq = 0;
   static bool prevActive = false;
@@ -1257,67 +1693,54 @@ void loop() {
     prevActive = activeNow;
     forceDraw = true;
   }
+#endif
 
-  // 物理 C ボタン（右下）でミュートON/OFF。音だけ消し、視覚は残す。
+  // 物理 C: 時計切替。重量モードでは一覧更新、キャリブ中はキャンセル。
   if (M5.BtnC.wasPressed()) {
-    gMuted = !gMuted;
-    if (gMuted) M5.Speaker.stop();
-    forceDraw = true;
-    Serial.printf("mute -> %d\n", gMuted ? 1 : 0);
-  }
-
-  // 物理 B ボタン（中央）でバッテリー残量表示をトグル。
-  if (M5.BtnB.wasPressed()) {
-    showBattery = !showBattery;
-    forceDraw = true;
-    Serial.printf("battery overlay -> %d\n", showBattery ? 1 : 0);
-  }
-
-  // 物理 A ボタン（左下）で心拍モード（BLE: Coros等のHRブロードキャスト）をトグル。
-  if (M5.BtnA.wasPressed()) {
-    hrMode = !hrMode;
-    forceDraw = true;
-    if (hrMode) {
-      if (!bleInited) {
-        NimBLEDevice::init("m5deck");
-        NimBLEScan *sc = NimBLEDevice::getScan();
-        sc->setScanCallbacks(&hrScanCallbacks, false);
-        sc->setActiveScan(true);
-        sc->setInterval(100);
-        sc->setWindow(80);
-        bleInited = true;
-      }
-      hrBpm = 0;
-      hrHasAddr = false;
-      hrState = HRS_SCAN;
-      hrNeedScan = true;
+    if (calMode) {
+      exitCalMode();
+    } else if (weightMode) {
+      agavRefreshPlants();
+      weightLastActivityMs = ms;
+      forceDraw = true;
     } else {
-      if (hrClient && hrClient->isConnected()) hrClient->disconnect();
-      if (bleInited) NimBLEDevice::getScan()->stop();
-      hrState = HRS_IDLE;
-      hrBpm = 0;
+      currentPanel = (currentPanel + 1) % PANEL_COUNT;
+      Serial.printf("panel -> %d\n", currentPanel);
     }
-    Serial.printf("HR mode -> %d\n", hrMode ? 1 : 0);
+    forceDraw = true;
   }
 
-  // 心拍モードのBLE状態遷移（アラート表示中も接続維持のため毎ループ実行）
-  if (hrMode) {
-    if (hrNeedScan && hrState == HRS_SCAN) {
-      hrNeedScan = false;
-      NimBLEDevice::getScan()->start(0, false);  // 0=無制限スキャン
-    }
-    if (hrState == HRS_SCAN && hrHasAddr) {
-      hrState = HRS_CONNECTING;
+  // 物理 B: 重量モードは短押し=タレ/送信、長押し(0.8s)=キャリブ。
+  if (weightMode && !calMode) {
+    if (agavIsSelectMode()) {
+      if (M5.BtnB.wasClicked()) {
+        agavConfirmSend();
+        weightLastActivityMs = ms;
+        forceDraw = true;
+      }
+    } else if (!agavIsSentMode() && M5.BtnB.wasHold()) {
+      enterCalMode();
+      weightLastActivityMs = ms;
+      forceDraw = true;
+    } else if (!agavIsSentMode() && M5.BtnB.wasClicked()) {
+      miniScaleTare(true);
+      weightLastActivityMs = ms;
       forceDraw = true;
     }
-    if (hrState == HRS_CONNECTING) {
-      if (hrConnect()) {
-        hrState = HRS_CONNECTED;
-      } else {
-        hrHasAddr = false;
-        hrState = HRS_SCAN;
-        hrNeedScan = true;
-      }
+  }
+
+  // 物理 A: 重量モードを終了。選択中は一度キャンセル。
+  if (M5.BtnA.wasPressed()) {
+    if (calMode) {
+      handleCalButtonA();
+      weightLastActivityMs = ms;
+      forceDraw = true;
+    } else if (weightMode && agavIsSelectMode()) {
+      agavCancelSelect();
+      weightLastActivityMs = ms;
+      forceDraw = true;
+    } else if (weightMode) {
+      exitWeightMode();
       forceDraw = true;
     }
   }
@@ -1335,6 +1758,7 @@ void loop() {
     }
   }
 
+#if ENABLE_LEGACY_EXTRAS
   // ---- アラート層 ① サイレン（未確認の ALERT）：時計より優先 ----
   // 5分鳴り続けたら不在とみなして自動ACK（消音して時計＋バッジへ）。
   static uint32_t sirenStartMs = 0;
@@ -1465,7 +1889,7 @@ void loop() {
   constexpr uint32_t ANGRY_MS = 5000;        // 怒り顔の表示時間（振動も同じ間ずっと）
   constexpr uint32_t ANGRY_COOLDOWN = 5000;  // 連続で怒らないように
 
-  if (!angryActive && !activeNow && !hrMode && remSeqNow <= remAckedSeq &&
+  if (!angryActive && !activeNow && !weightMode && remSeqNow <= remAckedSeq &&
       ms - lastAngry > ANGRY_COOLDOWN) {
     float ax, ay, az;
     if (M5.Imu.getAccel(&ax, &ay, &az)) {
@@ -1496,19 +1920,78 @@ void loop() {
     delay(10);
     return;
   }
+#endif
 
-  // 画面タップでパネルを切り替え（アラート無し時のみ。心拍モード中は無効）
-  if (tapped && !hrMode) {
-    currentPanel = (currentPanel + 1) % PANEL_COUNT;
+  // 重量モード: タッチ左右で株選択
+  if (tapped && weightMode && !calMode && agavEnabled() && agavIsSelectMode()) {
+    if (tapX < canvas.width() / 2) agavPrevPlant();
+    else agavNextPlant();
+    weightLastActivityMs = ms;
     forceDraw = true;
-    Serial.printf("panel -> %d\n", currentPanel);
+    tapped = false;
   }
 
-  // 心拍モード中は時計の代わりに心拍画面を表示
-  if (hrMode) {
+  // 時計画面のタップで重量モードへ。
+  if (tapped && !weightMode) {
+    enterWeightMode(ms);
+    forceDraw = true;
+    tapped = false;
+  }
+
+  if (tapped && weightMode) {
+    weightLastActivityMs = ms;
+    tapped = false;
+  }
+
+  if (weightMode &&
+      (calMode || weightLoadState == WLS_LOADED || agavIsSelectMode() ||
+       agavIsSentMode())) {
+    weightLastActivityMs = ms;
+  }
+  if (weightMode && !calMode && weightLoadState == WLS_IDLE &&
+      !agavIsSelectMode() && !agavIsSentMode() &&
+      ms - weightLastActivityMs >= WEIGHT_MODE_TIMEOUT_MS) {
+    exitWeightMode();
+    forceDraw = true;
+  }
+
+  // 重量モード中は時計の代わりに重量/キャリブ画面を表示
+  if (weightMode) {
+    if (agavEnabled() && !calMode) agavThumbService();
+    if (calMode) {
+      if (scaleFound) {
+        uint32_t adcU = 0;
+        float g = 0.0f;
+        if (miniScaleReadRaw(&adcU, &g)) {
+          calLiveAdc = miniScaleAdcU32ToS32(adcU);
+          calLiveG = g;
+        }
+      }
+      forceDraw = true;
+    } else if (ms - lastWeightRead >= 100) {
+      lastWeightRead = ms;
+      if (!scaleFound) {
+        scaleFound = miniScaleProbe();
+        if (scaleFound) {
+          restoreScaleFilters();
+          miniScaleTare(false);
+          pollWeight(ms);
+        }
+      } else {
+        pollWeight(ms);
+        agavTick(ms, weightDisplayG, weightLoadState == WLS_LOADED);
+      }
+      if (ms - lastWeightLog >= 1000) {
+        lastWeightLog = ms;
+        Serial.printf("weight raw=%.1f disp=%.1f g adc=%lu\n", weightRawG,
+                      weightGrams, (unsigned long)weightAdc);
+      }
+      forceDraw = true;
+    }
     if (forceDraw || ms - lastDraw >= 100) {
       lastDraw = ms;
-      renderHr(ms);
+      if (calMode) renderCal();
+      else renderWeight();
     }
     forceDraw = false;
     delay(15);
@@ -1527,9 +2010,7 @@ void loop() {
       renderDigital(tm, colonOn);
     }
   } else {  // PANEL_ANALOG
-    // 通常は1秒毎。未解決アラートのバッジ点滅中は速めに再描画。
-    const uint32_t interval = activeNow ? 250 : 1000;
-    if (forceDraw || ms - lastDraw >= interval) {
+    if (forceDraw || ms - lastDraw >= 1000) {
       lastDraw = ms;
       renderAnalog(tm);
     }
