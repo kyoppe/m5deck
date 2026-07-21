@@ -87,8 +87,6 @@ static bool manualTareActive = false;
 static uint32_t weightLastActivityMs = 0;
 static constexpr uint32_t WEIGHT_MODE_TIMEOUT_MS = 60UL * 1000UL;
 static bool scaleSessionReady = false;
-static bool weightStartupPending = false;
-static bool weightStartupScreenShown = false;
 static bool scaleWireReady = false;
 static bool scaleFiltersReady = false;
 static bool scaleFound = false;
@@ -107,6 +105,19 @@ static float weightUnitG = 0.0f;
 static float weightDisplayG = 0.0f;
 static uint32_t weightDisplayHoldMs = 0;
 static char weightHint[48] = "";
+
+enum ScaleZeroPhase {
+  SCALE_ZERO_IDLE = 0,
+  SCALE_ZERO_WARMUP,
+  SCALE_ZERO_CAPTURE,
+};
+static ScaleZeroPhase scaleZeroPhase = SCALE_ZERO_IDLE;
+static bool scaleZeroManual = false;
+static int scaleZeroSampleCount = 0;
+static int64_t scaleZeroAdcSum = 0;
+static uint32_t scaleZeroLastSampleMs = 0;
+static constexpr int SCALE_ZERO_WARMUP_SAMPLES = 12;
+static constexpr int SCALE_ZERO_CAPTURE_SAMPLES = 12;
 
 static int32_t miniScaleAdcU32ToS32(uint32_t adc) {
   int32_t v;
@@ -279,6 +290,98 @@ static bool miniScaleReadRaw(uint32_t *adcOut, float *gramsOut) {
   return true;
 }
 
+static bool scaleZeroActive() {
+  return scaleZeroPhase != SCALE_ZERO_IDLE;
+}
+
+static void updateZeroingDisplay(uint32_t adcU) {
+  weightAdc = adcU;
+  const int32_t adcS = miniScaleAdcU32ToS32(adcU);
+  weightRawG = miniScaleGramsFromAdcDelta(adcS - scaleZeroAdc);
+  weightGrams = weightRawG;
+  weightDisplayG = roundf(weightRawG * 10.0f) / 10.0f;
+  weightDisplayHoldMs = 0;
+}
+
+static bool beginScaleZero(bool manual, bool warmup) {
+  if (!scaleFound) return false;
+  if (!scaleFiltersReady) initScaleFilters();
+  refreshScaleGap();
+  scaleZeroPhase = warmup ? SCALE_ZERO_WARMUP : SCALE_ZERO_CAPTURE;
+  scaleZeroManual = manual;
+  scaleZeroSampleCount = 0;
+  scaleZeroAdcSum = 0;
+  scaleZeroLastSampleMs = 0;
+  manualTareActive = manual;
+  resetWeightState();
+  snprintf(weightHint, sizeof(weightHint), "ZEROING 0/%d",
+           warmup ? SCALE_ZERO_WARMUP_SAMPLES + SCALE_ZERO_CAPTURE_SAMPLES
+                  : SCALE_ZERO_CAPTURE_SAMPLES);
+  return true;
+}
+
+static void serviceScaleZero(uint32_t nowMs) {
+  if (!scaleZeroActive()) return;
+  const uint32_t intervalMs =
+      scaleZeroPhase == SCALE_ZERO_WARMUP ? 50 : 40;
+  if (scaleZeroLastSampleMs != 0 &&
+      nowMs - scaleZeroLastSampleMs < intervalMs) {
+    return;
+  }
+  scaleZeroLastSampleMs = nowMs;
+
+  uint32_t adcU = 0;
+  float unitGrams = 0.0f;
+  if (!miniScaleReadRaw(&adcU, &unitGrams)) {
+    scaleFound = false;
+    scaleFiltersReady = false;
+    scaleSessionReady = false;
+    scaleZeroPhase = SCALE_ZERO_IDLE;
+    snprintf(weightHint, sizeof(weightHint), "I2C read fail");
+    return;
+  }
+  weightUnitG = unitGrams;
+  const int32_t adcS = miniScaleAdcU32ToS32(adcU);
+
+  if (scaleZeroPhase == SCALE_ZERO_WARMUP) {
+    if (scaleZeroSampleCount == 0) scaleZeroAdc = adcS;
+    scaleZeroSampleCount++;
+    updateZeroingDisplay(adcU);
+    snprintf(weightHint, sizeof(weightHint), "ZEROING %d/%d",
+             scaleZeroSampleCount,
+             SCALE_ZERO_WARMUP_SAMPLES + SCALE_ZERO_CAPTURE_SAMPLES);
+    if (scaleZeroSampleCount >= SCALE_ZERO_WARMUP_SAMPLES) {
+      scaleZeroPhase = SCALE_ZERO_CAPTURE;
+      scaleZeroSampleCount = 0;
+      scaleZeroAdcSum = 0;
+    }
+    return;
+  }
+
+  scaleZeroAdcSum += adcS;
+  scaleZeroSampleCount++;
+  scaleZeroAdc = (int32_t)(scaleZeroAdcSum / scaleZeroSampleCount);
+  updateZeroingDisplay(adcU);
+  const int completed =
+      (scaleZeroManual ? 0 : SCALE_ZERO_WARMUP_SAMPLES) +
+      scaleZeroSampleCount;
+  const int total =
+      (scaleZeroManual ? 0 : SCALE_ZERO_WARMUP_SAMPLES) +
+      SCALE_ZERO_CAPTURE_SAMPLES;
+  snprintf(weightHint, sizeof(weightHint), "ZEROING %d/%d", completed, total);
+
+  if (scaleZeroSampleCount >= SCALE_ZERO_CAPTURE_SAMPLES) {
+    scaleZeroPhase = SCALE_ZERO_IDLE;
+    scaleSessionReady = scaleFiltersReady && scaleZeroAdc != 0;
+    resetWeightState();
+    weightRawG = 0.0f;
+    weightDisplayG = 0.0f;
+    weightHint[0] = '\0';
+    Serial.printf("scale zero ready -> adc=%ld manual=%d\n",
+                  (long)scaleZeroAdc, scaleZeroManual ? 1 : 0);
+  }
+}
+
 static void restoreScaleFilters() {
   scaleFiltersReady = false;
   initScaleFilters();
@@ -342,12 +445,15 @@ static bool pollWeight(uint32_t nowMs) {
 static void miniScaleTare(bool manual = false) {
   if (!scaleFound) return;
   if (!miniScaleCaptureZeroAdc(&scaleZeroAdc)) return;
+  scaleZeroPhase = SCALE_ZERO_IDLE;
   manualTareActive = manual;
   weightTareG = 0.0f;
   resetWeightState();
   weightDisplayG = 0.0f;
   weightDisplayHoldMs = 0;
   refreshScaleGap();
+  scaleSessionReady = scaleFiltersReady && scaleZeroAdc != 0;
+  weightHint[0] = '\0';
   Serial.printf("scale tare -> zero_adc=%ld gap=%.1f\n", (long)scaleZeroAdc,
                 scaleGap);
 }
@@ -432,6 +538,7 @@ static bool miniScaleWriteGap(float gap) {
 }
 
 static void enterCalMode() {
+  scaleZeroPhase = SCALE_ZERO_IDLE;
   calMode = true;
   calStep = CAL_EMPTY;
   calMsg[0] = '\0';
@@ -1602,7 +1709,6 @@ static void renderAngry(uint32_t ms) {
 // ---- 重量モード画面 -----------------------------------------------------
 static void renderWeight() {
   AgavWeightView view = {
-      .starting = weightStartupPending,
       .scaleFound = scaleFound,
       .scaleGapOk = scaleGapOk,
       .manualTareActive = manualTareActive,
@@ -1613,39 +1719,37 @@ static void renderWeight() {
   canvas.pushSprite(0, 0);
 }
 
+static void startScaleSession() {
+  initScaleWire();
+  scaleFound = miniScaleProbe();
+  scaleFiltersReady = false;
+  scaleSessionReady = false;
+  weightTareG = 0.0f;
+  resetWeightState();
+  lastWeightRead = 0;
+  lastWeightLog = 0;
+  if (scaleFound) {
+    initScaleFilters();
+    beginScaleZero(false, true);
+  } else {
+    snprintf(weightHint, sizeof(weightHint), "Scale not found");
+  }
+}
+
 static void enterWeightMode(uint32_t nowMs) {
   if (weightMode) return;
   weightMode = true;
   manualTareActive = false;
   weightLastActivityMs = nowMs;
   agavOnWeightModeEnter();
+  agavStartPlantPreload();
 
-  weightStartupPending = !scaleSessionReady || !agavHasPlants();
-  weightStartupScreenShown = !weightStartupPending;
-  if (!weightStartupPending) {
-    resetWeightState();
+  resetWeightState();
+  if (!scaleSessionReady) {
+    startScaleSession();
+  } else {
     pollWeight(nowMs);
   }
-}
-
-static void finishWeightStartup(uint32_t nowMs) {
-  if (!scaleSessionReady) {
-    initScaleWire();
-    scaleFound = miniScaleProbe();
-    scaleFiltersReady = false;
-    weightTareG = 0.0f;
-    resetWeightState();
-    lastWeightRead = 0;
-    lastWeightLog = 0;
-    if (scaleFound) {
-      restoreScaleFilters();
-      miniScaleTare(false);
-      pollWeight(nowMs);
-      scaleSessionReady = scaleFiltersReady && scaleZeroAdc != 0;
-    }
-  }
-  agavLoadPlantsIfNeeded();
-  weightStartupPending = false;
   Serial.printf("weight mode -> 1 (scale %s, plants %d)\n",
                 scaleFound ? "OK" : "NOT FOUND", agavPlantCount());
 }
@@ -1653,8 +1757,7 @@ static void finishWeightStartup(uint32_t nowMs) {
 static void exitWeightMode() {
   if (!weightMode) return;
   weightMode = false;
-  weightStartupPending = false;
-  weightStartupScreenShown = false;
+  scaleZeroPhase = SCALE_ZERO_IDLE;
   manualTareActive = false;
   agavOnWeightModeExit();
   calMode = false;
@@ -1680,6 +1783,7 @@ void setup() {
 
   computeLayout();
   syncTime();
+  agavStartPlantPreload();
 
 #if ENABLE_LEGACY_EXTRAS
   // ポーリングは別タスク(core0)で常時実行。メインループ(core1)は止めない。
@@ -1721,7 +1825,9 @@ void loop() {
     if (calMode) {
       exitCalMode();
     } else if (weightMode) {
-      agavRefreshPlants();
+      if (!agavIsSelectMode() && !agavIsSentMode()) {
+        agavRefreshPlants();
+      }
       weightLastActivityMs = ms;
       forceDraw = true;
     } else {
@@ -1744,7 +1850,7 @@ void loop() {
       weightLastActivityMs = ms;
       forceDraw = true;
     } else if (!agavIsSentMode() && M5.BtnB.wasClicked()) {
-      miniScaleTare(true);
+      beginScaleZero(true, false);
       weightLastActivityMs = ms;
       forceDraw = true;
     }
@@ -1978,16 +2084,8 @@ void loop() {
 
   // 重量モード中は時計の代わりに重量/キャリブ画面を表示
   if (weightMode) {
-    if (weightStartupPending && !weightStartupScreenShown) {
-      lastDraw = ms;
-      renderWeight();
-      weightStartupScreenShown = true;
-      forceDraw = false;
-      delay(1);
-      return;
-    }
-    if (weightStartupPending) {
-      finishWeightStartup(ms);
+    if (scaleZeroActive() && !calMode) {
+      serviceScaleZero(ms);
       forceDraw = true;
     }
     if (agavEnabled() && !calMode) agavThumbService();
@@ -2001,26 +2099,26 @@ void loop() {
         }
       }
       forceDraw = true;
-    } else if (ms - lastWeightRead >= 100) {
+    } else if (!scaleZeroActive() && ms - lastWeightRead >= 100) {
       lastWeightRead = ms;
       if (!scaleFound) {
         scaleFound = miniScaleProbe();
         if (scaleFound) {
-          restoreScaleFilters();
-          miniScaleTare(false);
-          pollWeight(ms);
-          scaleSessionReady = scaleFiltersReady && scaleZeroAdc != 0;
+          scaleFiltersReady = false;
+          initScaleFilters();
+          beginScaleZero(false, true);
         }
       } else {
         pollWeight(ms);
         agavTick(ms, weightDisplayG, weightLoadState == WLS_LOADED);
       }
-      if (ms - lastWeightLog >= 1000) {
-        lastWeightLog = ms;
-        Serial.printf("weight raw=%.1f disp=%.1f g adc=%lu\n", weightRawG,
-                      weightGrams, (unsigned long)weightAdc);
-      }
       forceDraw = true;
+    }
+    if (!calMode && ms - lastWeightLog >= 1000) {
+      lastWeightLog = ms;
+      Serial.printf("weight raw=%.1f disp=%.1f g adc=%lu zeroing=%d\n",
+                    weightRawG, weightGrams, (unsigned long)weightAdc,
+                    scaleZeroActive() ? 1 : 0);
     }
     if (forceDraw || ms - lastDraw >= 100) {
       lastDraw = ms;

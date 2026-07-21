@@ -6,6 +6,7 @@
 #include <WiFiClientSecure.h>
 
 #include "agav_brand.h"
+#include "agav_tls.h"
 #include "agavydration.h"
 #include "secrets.h"
 
@@ -15,12 +16,19 @@
 #ifndef AGAV_DEVICE_TOKEN
 #define AGAV_DEVICE_TOKEN ""
 #endif
+#ifndef AGAV_CF_ACCESS_CLIENT_ID
+#define AGAV_CF_ACCESS_CLIENT_ID ""
+#endif
+#ifndef AGAV_CF_ACCESS_CLIENT_SECRET
+#define AGAV_CF_ACCESS_CLIENT_SECRET ""
+#endif
 
 static constexpr int kThumbPx = 96;
 static constexpr size_t kMaxDownloadBytes = 65536;
 static constexpr int kCacheSlots = 6;
-static constexpr uint32_t kRequestDebounceMs = 250;
+static constexpr uint32_t kRequestDebounceMs = 80;
 static constexpr uint32_t kDownloadTimeoutMs = 4000;
+static constexpr int kPrefetchCount = 5;
 
 struct ThumbSlot {
   int index = -1;
@@ -32,20 +40,47 @@ static ThumbSlot gSlots[kCacheSlots];
 static uint8_t gSlotAge[kCacheSlots] = {};
 static uint8_t gSlotTick = 0;
 
+struct ThumbDownloadJob {
+  int index = -1;
+  uint32_t generation = 0;
+  char path[192] = "";
+};
+
+static portMUX_TYPE gThumbMux = portMUX_INITIALIZER_UNLOCKED;
 static int gThumbPending = -1;
 static uint32_t gThumbPendingSinceMs = 0;
-static bool gThumbLoading = false;
+static bool gThumbWorkerRunning = false;
+static ThumbDownloadJob gThumbJob;
+static uint8_t *gThumbResultBuf = nullptr;
+static size_t gThumbResultLen = 0;
+static int gThumbResultIndex = -1;
+static uint32_t gThumbResultGeneration = 0;
+static bool gCacheResetRequested = false;
+static uint32_t gCacheGeneration = 0;
+static int gPrefetchNext = -1;
+static int gPrefetchRemaining = 0;
 
 static bool httpBegin(HTTPClient &http, const String &url, WiFiClient &plain,
                       WiFiClientSecure &secure) {
   if (url.startsWith("https://")) {
-    secure.setInsecure();
+    secure.setCACert(AGAV_ROOT_CA);
     return http.begin(secure, url);
   }
   return http.begin(plain, url);
 }
 
 static void httpAuth(HTTPClient &http) {
+  const bool accessConfigured =
+      AGAV_CF_ACCESS_CLIENT_ID[0] != '\0' &&
+      AGAV_CF_ACCESS_CLIENT_SECRET[0] != '\0';
+  if (accessConfigured && strncmp(AGAV_API_URL, "https://", 8) != 0) {
+    return;
+  }
+  if (accessConfigured) {
+    http.addHeader("CF-Access-Client-Id", AGAV_CF_ACCESS_CLIENT_ID);
+    http.addHeader("CF-Access-Client-Secret",
+                   AGAV_CF_ACCESS_CLIENT_SECRET);
+  }
   if (AGAV_DEVICE_TOKEN[0] != '\0') {
     http.addHeader("Authorization", String("Bearer ") + AGAV_DEVICE_TOKEN);
   }
@@ -200,19 +235,10 @@ static void cacheFreeAll() {
   gSlotTick = 0;
 }
 
-static bool loadThumbForIndex(int index) {
-  char path[192];
-  if (!agavPlantThumbPath(index, path, sizeof(path))) return false;
-
-  uint8_t *buf = nullptr;
-  size_t len = 0;
-  if (!downloadPathToBuffer(path, &buf, &len) || !buf) return false;
-
+static bool decodeBufferToCache(int index, const uint8_t *buf, size_t len) {
   const int slot = cacheAlloc(index);
   M5Canvas *sprite = ensureSlotSprite(gSlots[slot]);
   const bool ok = sprite && decodeToSprite(*sprite, buf, len);
-  free(buf);
-
   if (!ok) return false;
   gSlots[slot].index = index;
   gSlots[slot].ready = true;
@@ -220,37 +246,178 @@ static bool loadThumbForIndex(int index) {
   return true;
 }
 
-void agavThumbInit() {}
+static void thumbDownloadTask(void *) {
+  uint8_t *buf = nullptr;
+  size_t len = 0;
+  const bool ok =
+      downloadPathToBuffer(gThumbJob.path, &buf, &len) && buf != nullptr;
+
+  portENTER_CRITICAL(&gThumbMux);
+  if (ok && gThumbResultBuf == nullptr) {
+    gThumbResultBuf = buf;
+    gThumbResultLen = len;
+    gThumbResultIndex = gThumbJob.index;
+    gThumbResultGeneration = gThumbJob.generation;
+    buf = nullptr;
+  }
+  gThumbWorkerRunning = false;
+  portEXIT_CRITICAL(&gThumbMux);
+
+  if (buf) free(buf);
+  vTaskDelete(nullptr);
+}
+
+static bool startThumbDownload(int index) {
+  char path[sizeof(gThumbJob.path)];
+  if (!agavPlantThumbPath(index, path, sizeof(path))) return false;
+
+  portENTER_CRITICAL(&gThumbMux);
+  if (gThumbWorkerRunning || gThumbResultBuf != nullptr) {
+    portEXIT_CRITICAL(&gThumbMux);
+    return false;
+  }
+  gThumbJob.index = index;
+  gThumbJob.generation = gCacheGeneration;
+  snprintf(gThumbJob.path, sizeof(gThumbJob.path), "%s", path);
+  gThumbWorkerRunning = true;
+  portEXIT_CRITICAL(&gThumbMux);
+
+  const BaseType_t created = xTaskCreatePinnedToCore(
+      thumbDownloadTask, "agav-thumb", 12288, nullptr, 1, nullptr, 0);
+  if (created == pdPASS) return true;
+
+  portENTER_CRITICAL(&gThumbMux);
+  gThumbWorkerRunning = false;
+  portEXIT_CRITICAL(&gThumbMux);
+  return false;
+}
+
+static void schedulePrefetchFrom(int plantIndex) {
+  const int count = agavPlantCount();
+  if (count <= 1) {
+    gPrefetchNext = -1;
+    gPrefetchRemaining = 0;
+    return;
+  }
+  gPrefetchNext = (plantIndex + 1) % count;
+  gPrefetchRemaining = min(kPrefetchCount, count - 1);
+}
+
+static void requestImmediate(int plantIndex) {
+  if (plantIndex < 0) return;
+  if (cacheFind(plantIndex) >= 0) return;
+  gThumbPending = plantIndex;
+  gThumbPendingSinceMs = millis() - kRequestDebounceMs;
+}
+
+void agavThumbInit() {
+  if (agavPlantCount() <= 0) return;
+  const int index = agavPlantIndex();
+  requestImmediate(index);
+  schedulePrefetchFrom(index);
+}
 
 void agavThumbShutdown() {
   gThumbPending = -1;
   gThumbPendingSinceMs = 0;
-  gThumbLoading = false;
-  cacheFreeAll();
+  gPrefetchNext = -1;
+  gPrefetchRemaining = 0;
 }
 
 void agavThumbRequest(int plantIndex) {
   if (plantIndex < 0) return;
   if (cacheFind(plantIndex) >= 0) {
+    const int slot = cacheFind(plantIndex);
+    if (slot >= 0) gSlotAge[slot] = ++gSlotTick;
     gThumbPending = -1;
     gThumbPendingSinceMs = 0;
+    schedulePrefetchFrom(plantIndex);
     return;
   }
   gThumbPending = plantIndex;
   gThumbPendingSinceMs = millis();
+  schedulePrefetchFrom(plantIndex);
+}
+
+void agavThumbRequestCacheReset() {
+  portENTER_CRITICAL(&gThumbMux);
+  gCacheResetRequested = true;
+  portEXIT_CRITICAL(&gThumbMux);
 }
 
 void agavThumbService() {
-  if (gThumbLoading || gThumbPending < 0) return;
-  if (millis() - gThumbPendingSinceMs < kRequestDebounceMs) return;
-  const int idx = gThumbPending;
-  gThumbPending = -1;
-  gThumbLoading = true;
-  loadThumbForIndex(idx);
-  gThumbLoading = false;
+  bool resetRequested = false;
+  uint8_t *resultBuf = nullptr;
+  size_t resultLen = 0;
+  int resultIndex = -1;
+  uint32_t resultGeneration = 0;
+  bool workerRunning = false;
+
+  portENTER_CRITICAL(&gThumbMux);
+  resetRequested = gCacheResetRequested;
+  gCacheResetRequested = false;
+  if (gThumbResultBuf != nullptr) {
+    resultBuf = gThumbResultBuf;
+    resultLen = gThumbResultLen;
+    resultIndex = gThumbResultIndex;
+    resultGeneration = gThumbResultGeneration;
+    gThumbResultBuf = nullptr;
+    gThumbResultLen = 0;
+    gThumbResultIndex = -1;
+  }
+  workerRunning = gThumbWorkerRunning;
+  portEXIT_CRITICAL(&gThumbMux);
+
+  if (resetRequested) {
+    gCacheGeneration++;
+    cacheFreeAll();
+    gThumbPending = -1;
+    gPrefetchNext = -1;
+    gPrefetchRemaining = 0;
+    if (agavPlantCount() > 0) {
+      const int index = agavPlantIndex();
+      requestImmediate(index);
+      schedulePrefetchFrom(index);
+    }
+  }
+
+  if (resultBuf) {
+    if (resultGeneration == gCacheGeneration) {
+      if (decodeBufferToCache(resultIndex, resultBuf, resultLen) &&
+          gThumbPending == resultIndex) {
+        gThumbPending = -1;
+        gThumbPendingSinceMs = 0;
+      }
+    }
+    free(resultBuf);
+  }
+
+  if (workerRunning) return;
+  if (gThumbPending >= 0) {
+    if (millis() - gThumbPendingSinceMs < kRequestDebounceMs) return;
+    const int index = gThumbPending;
+    gThumbPending = -1;
+    startThumbDownload(index);
+    return;
+  }
+
+  while (gPrefetchRemaining > 0 && gPrefetchNext >= 0) {
+    const int index = gPrefetchNext;
+    const int count = agavPlantCount();
+    gPrefetchNext = count > 0 ? (gPrefetchNext + 1) % count : -1;
+    gPrefetchRemaining--;
+    if (cacheFind(index) >= 0) continue;
+    if (startThumbDownload(index)) return;
+  }
 }
 
-bool agavThumbLoading() { return gThumbLoading || gThumbPending >= 0; }
+bool agavThumbLoading() {
+  portENTER_CRITICAL(&gThumbMux);
+  const bool workerRunning =
+      gThumbWorkerRunning || gThumbResultBuf != nullptr;
+  portEXIT_CRITICAL(&gThumbMux);
+  return workerRunning || gThumbPending >= 0;
+}
 
 bool agavThumbDraw(M5Canvas &canvas, int x, int y, int size, const char *label,
                    int plantIndex) {

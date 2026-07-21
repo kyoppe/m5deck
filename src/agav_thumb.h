@@ -5,6 +5,7 @@
 void agavThumbInit();
 void agavThumbShutdown();
 void agavThumbRequest(int plantIndex);
+void agavThumbRequestCacheReset();
 void agavThumbService();
 bool agavThumbDraw(M5Canvas &canvas, int x, int y, int size, const char *label,
                    int plantIndex = -1);

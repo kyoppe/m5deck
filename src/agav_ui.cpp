@@ -235,12 +235,6 @@ static void renderMeasuring(M5Canvas &c, const AgavWeightView &view) {
   c.fillScreen(AGAV_BG);
   drawWatermark(c);
 
-  if (view.starting) {
-    drawScaledCenterText(c, "Starting...", W / 2, H / 2, 28.0f, AGAV_SAND,
-                         AGAV_BG);
-    drawFooter(c, "A: exit", "", AGAV_BG);
-    return;
-  }
   if (!view.scaleFound) {
     drawScaledCenterText(c, "No scale", W / 2, H / 2, 28.0f, AGAV_RUST, AGAV_BG);
     drawFooter(c, "A: exit", "", AGAV_BG);

@@ -31,7 +31,7 @@ enum AgavSendState {
 bool agavEnabled();
 void agavOnWeightModeEnter();
 void agavOnWeightModeExit();
-void agavLoadPlantsIfNeeded();
+void agavStartPlantPreload();
 void agavTick(uint32_t nowMs, float displayG, bool loaded);
 void agavPrevPlant();
 void agavNextPlant();
