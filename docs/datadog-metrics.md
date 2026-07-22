@@ -68,8 +68,9 @@ Header: DD-API-KEY: <DD_API_KEY>
 
 Linux の `system.cpu.user` と同様、**ホスト全体で 0-100%** です。
 
-- core0 / core1 のアイドルフックで idle 時間を積算 (呼び出し間隔の閾値なし)
-- 15 秒ウィンドウの平均: `cpu.user = 100 - (idle0% + idle1%) / 2`
+- core0 / core1 の idle hook で連続 idle 区間のみ積算 (hook 間隔が 3ms 超のギャップは busy とみなして除外)
+- 15 秒ウィンドウ: `cpu.user = 100 - (idle0% + idle1%) / 2`
+- Arduino ESP32 のプリビルド FreeRTOS には `uxTaskGetSystemState` が無いため run-time stats は未使用
 - `num_cores:2` は `cpu.user` のみ (メタデータタグ)
 
 ## Wi-Fi と死活監視の方針

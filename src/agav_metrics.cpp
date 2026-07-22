@@ -30,6 +30,8 @@
 #endif
 
 static constexpr uint32_t kMetricsIntervalMs = 15000;
+// Gaps longer than this between idle-hook calls mean a non-idle task ran.
+static constexpr uint64_t kIdleMaxGapUs = 3000;
 static constexpr const char *kDeviceTag = "device:m5deck";
 static constexpr int kUsbVbusPresentMv = 4000;
 
@@ -52,7 +54,10 @@ static bool idleHookCore0() {
   portENTER_CRITICAL(&g_idleMux);
   const uint64_t last = g_idleLastUs[0];
   if (last != 0) {
-    g_idleUs[0] += now - last;
+    const uint64_t delta = now - last;
+    if (delta <= kIdleMaxGapUs) {
+      g_idleUs[0] += delta;
+    }
   }
   g_idleLastUs[0] = now;
   portEXIT_CRITICAL(&g_idleMux);
@@ -64,7 +69,10 @@ static bool idleHookCore1() {
   portENTER_CRITICAL(&g_idleMux);
   const uint64_t last = g_idleLastUs[1];
   if (last != 0) {
-    g_idleUs[1] += now - last;
+    const uint64_t delta = now - last;
+    if (delta <= kIdleMaxGapUs) {
+      g_idleUs[1] += delta;
+    }
   }
   g_idleLastUs[1] = now;
   portEXIT_CRITICAL(&g_idleMux);
