@@ -4,8 +4,10 @@
 #include <M5Unified.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <ArduinoJson.h>
 
 #include "agav_brand.h"
+#include "agav_network.h"
 #include "agav_tls.h"
 #include "agavydration.h"
 #include "secrets.h"
@@ -25,10 +27,13 @@
 
 static constexpr int kThumbPx = 96;
 static constexpr size_t kMaxDownloadBytes = 65536;
-static constexpr int kCacheSlots = 6;
+static constexpr size_t kMaxBatchBytes =
+    6 + 8 * (8 + kMaxDownloadBytes);
+static constexpr int kCacheSlots = 12;
 static constexpr uint32_t kRequestDebounceMs = 80;
 static constexpr uint32_t kDownloadTimeoutMs = 4000;
-static constexpr int kPrefetchCount = 5;
+static constexpr int kBatchSize = 8;
+static constexpr int kMinCachedAhead = 4;
 
 struct ThumbSlot {
   int index = -1;
@@ -37,13 +42,14 @@ struct ThumbSlot {
 };
 
 static ThumbSlot gSlots[kCacheSlots];
-static uint8_t gSlotAge[kCacheSlots] = {};
-static uint8_t gSlotTick = 0;
+static uint32_t gSlotAge[kCacheSlots] = {};
+static uint32_t gSlotTick = 0;
 
 struct ThumbDownloadJob {
-  int index = -1;
   uint32_t generation = 0;
-  char path[192] = "";
+  int count = 0;
+  int indexes[kBatchSize] = {};
+  char paths[kBatchSize][192] = {};
 };
 
 static portMUX_TYPE gThumbMux = portMUX_INITIALIZER_UNLOCKED;
@@ -53,12 +59,14 @@ static bool gThumbWorkerRunning = false;
 static ThumbDownloadJob gThumbJob;
 static uint8_t *gThumbResultBuf = nullptr;
 static size_t gThumbResultLen = 0;
-static int gThumbResultIndex = -1;
+static int gThumbResultCount = 0;
+static int gThumbResultIndexes[kBatchSize] = {};
 static uint32_t gThumbResultGeneration = 0;
 static bool gCacheResetRequested = false;
 static uint32_t gCacheGeneration = 0;
-static int gPrefetchNext = -1;
-static int gPrefetchRemaining = 0;
+static bool gUnavailable[AGAV_MAX_PLANTS] = {};
+static bool gPrefetchEnabled = true;
+static bool gThumbPendingRequired = false;
 
 static bool httpBegin(HTTPClient &http, const String &url, WiFiClient &plain,
                       WiFiClientSecure &secure) {
@@ -86,10 +94,11 @@ static void httpAuth(HTTPClient &http) {
   }
 }
 
-static bool httpReadBody(HTTPClient &http, uint8_t **outBuf, size_t *outLen) {
+static bool httpReadBody(HTTPClient &http, uint8_t **outBuf, size_t *outLen,
+                         size_t maxBytes, bool requireImage) {
   WiFiClient *stream = http.getStreamPtr();
   const int contentLength = http.getSize();
-  if (contentLength > (int)kMaxDownloadBytes) return false;
+  if (contentLength > (int)maxBytes) return false;
 
   size_t cap =
       contentLength > 0 ? (size_t)contentLength : (size_t)8192;
@@ -111,8 +120,8 @@ static bool httpReadBody(HTTPClient &http, uint8_t **outBuf, size_t *outLen) {
     }
 
     if (contentLength < 0 && len == cap) {
-      if (cap >= kMaxDownloadBytes) break;
-      const size_t newCap = min(cap * 2, kMaxDownloadBytes);
+      if (cap >= maxBytes) break;
+      const size_t newCap = min(cap * 2, maxBytes);
       uint8_t *grown = (uint8_t *)ps_realloc(buf, newCap);
       if (!grown) break;
       buf = grown;
@@ -129,7 +138,7 @@ static bool httpReadBody(HTTPClient &http, uint8_t **outBuf, size_t *outLen) {
     }
     len += (size_t)n;
     if (contentLength >= 0 && len >= (size_t)contentLength) break;
-    if (len >= kMaxDownloadBytes) break;
+    if (len >= maxBytes) break;
   }
 
   if (contentLength > 0 && len != (size_t)contentLength) {
@@ -140,38 +149,54 @@ static bool httpReadBody(HTTPClient &http, uint8_t **outBuf, size_t *outLen) {
     free(buf);
     return false;
   }
-  const bool isJpeg = buf[0] == 0xFF && buf[1] == 0xD8;
-  const bool isPng = buf[0] == 0x89 && buf[1] == 0x50;
-  if (!isJpeg && !isPng) {
-    free(buf);
-    return false;
+  if (requireImage) {
+    const bool isJpeg = buf[0] == 0xFF && buf[1] == 0xD8;
+    const bool isPng = buf[0] == 0x89 && buf[1] == 0x50;
+    if (!isJpeg && !isPng) {
+      free(buf);
+      return false;
+    }
   }
   *outBuf = buf;
   *outLen = len;
   return true;
 }
 
-static bool downloadPathToBuffer(const char *path, uint8_t **outBuf,
-                                 size_t *outLen) {
-  if (!path || path[0] == '\0') return false;
+static bool downloadBatchToBuffer(const ThumbDownloadJob &job,
+                                  uint8_t **outBuf, size_t *outLen) {
+  if (job.count <= 0) return false;
   if (WiFi.status() != WL_CONNECTED) return false;
+  AgavNetworkGuard network(25000);
+  if (!network) return false;
+
+  JsonDocument requestDoc;
+  JsonArray paths = requestDoc["paths"].to<JsonArray>();
+  for (int i = 0; i < job.count; i++) {
+    paths.add(job.paths[i]);
+  }
+  String requestBody;
+  serializeJson(requestDoc, requestBody);
 
   WiFiClient plain;
   WiFiClientSecure secure;
   HTTPClient http;
-  const String url = String(AGAV_API_URL) + path;
+  const String url = String(AGAV_API_URL) + "/api/device/photos/batch";
   if (!httpBegin(http, url, plain, secure)) return false;
   httpAuth(http);
-  http.useHTTP10(true);
+  http.addHeader("Content-Type", "application/json");
   http.setTimeout(kDownloadTimeoutMs);
-  const int code = http.GET();
+  const int code =
+      http.POST((uint8_t *)requestBody.c_str(), requestBody.length());
   if (code != 200) {
     http.end();
     return false;
   }
-  const bool ok = httpReadBody(http, outBuf, outLen);
+  const bool ok =
+      httpReadBody(http, outBuf, outLen, kMaxBatchBytes, false);
   http.end();
-  return ok;
+  return ok && *outLen >= 6 && (*outBuf)[0] == 'A' &&
+         (*outBuf)[1] == 'G' && (*outBuf)[2] == 'B' &&
+         (*outBuf)[3] == '1';
 }
 
 static M5Canvas *ensureSlotSprite(ThumbSlot &slot) {
@@ -206,13 +231,26 @@ static int cacheAlloc(int index) {
   int slot = cacheFind(index);
   if (slot >= 0) return slot;
   slot = 0;
-  uint8_t oldest = 255;
+  uint32_t oldest = UINT32_MAX;
+  bool foundUnprotected = false;
+  const int current = agavPlantIndex();
+  const int plantCount = agavPlantCount();
   for (int i = 0; i < kCacheSlots; i++) {
     if (!gSlots[i].ready) {
       slot = i;
       break;
     }
-    if (gSlotAge[i] < oldest) {
+    const int forwardDistance =
+        plantCount > 0
+            ? (gSlots[i].index - current + plantCount) % plantCount
+            : kMinCachedAhead + 1;
+    const bool protectedSlot =
+        forwardDistance >= 0 && forwardDistance <= kMinCachedAhead;
+    if (!protectedSlot && (!foundUnprotected || gSlotAge[i] < oldest)) {
+      foundUnprotected = true;
+      oldest = gSlotAge[i];
+      slot = i;
+    } else if (!foundUnprotected && gSlotAge[i] < oldest) {
       oldest = gSlotAge[i];
       slot = i;
     }
@@ -250,13 +288,16 @@ static void thumbDownloadTask(void *) {
   uint8_t *buf = nullptr;
   size_t len = 0;
   const bool ok =
-      downloadPathToBuffer(gThumbJob.path, &buf, &len) && buf != nullptr;
+      downloadBatchToBuffer(gThumbJob, &buf, &len) && buf != nullptr;
 
   portENTER_CRITICAL(&gThumbMux);
   if (ok && gThumbResultBuf == nullptr) {
     gThumbResultBuf = buf;
     gThumbResultLen = len;
-    gThumbResultIndex = gThumbJob.index;
+    gThumbResultCount = gThumbJob.count;
+    for (int i = 0; i < gThumbJob.count; i++) {
+      gThumbResultIndexes[i] = gThumbJob.indexes[i];
+    }
     gThumbResultGeneration = gThumbJob.generation;
     buf = nullptr;
   }
@@ -267,18 +308,33 @@ static void thumbDownloadTask(void *) {
   vTaskDelete(nullptr);
 }
 
-static bool startThumbDownload(int index) {
-  char path[sizeof(gThumbJob.path)];
-  if (!agavPlantThumbPath(index, path, sizeof(path))) return false;
+static bool startThumbBatch(int startIndex) {
+  const int plantCount = agavPlantCount();
+  if (plantCount <= 0) return false;
+
+  ThumbDownloadJob job;
+  job.generation = gCacheGeneration;
+  for (int offset = 0;
+       offset < plantCount && job.count < kBatchSize; offset++) {
+    const int index = (startIndex + offset) % plantCount;
+    if (cacheFind(index) >= 0 || gUnavailable[index]) continue;
+    char path[sizeof(job.paths[0])];
+    if (!agavPlantThumbPath(index, path, sizeof(path))) {
+      gUnavailable[index] = true;
+      continue;
+    }
+    job.indexes[job.count] = index;
+    snprintf(job.paths[job.count], sizeof(job.paths[job.count]), "%s", path);
+    job.count++;
+  }
+  if (job.count == 0) return false;
 
   portENTER_CRITICAL(&gThumbMux);
   if (gThumbWorkerRunning || gThumbResultBuf != nullptr) {
     portEXIT_CRITICAL(&gThumbMux);
     return false;
   }
-  gThumbJob.index = index;
-  gThumbJob.generation = gCacheGeneration;
-  snprintf(gThumbJob.path, sizeof(gThumbJob.path), "%s", path);
+  gThumbJob = job;
   gThumbWorkerRunning = true;
   portEXIT_CRITICAL(&gThumbMux);
 
@@ -292,51 +348,78 @@ static bool startThumbDownload(int index) {
   return false;
 }
 
-static void schedulePrefetchFrom(int plantIndex) {
+static void setBatchPending(int startIndex, bool required, bool immediate) {
+  if (startIndex < 0) return;
+  if (gThumbPending >= 0 && gThumbPendingRequired && !required) return;
+  gThumbPending = startIndex;
+  gThumbPendingRequired = required;
+  gThumbPendingSinceMs =
+      immediate ? millis() - kRequestDebounceMs : millis();
+}
+
+static void scheduleRollingPrefetch(int plantIndex) {
   const int count = agavPlantCount();
-  if (count <= 1) {
-    gPrefetchNext = -1;
-    gPrefetchRemaining = 0;
+  if (count <= 0 || plantIndex < 0) return;
+  if (cacheFind(plantIndex) < 0 && !gUnavailable[plantIndex]) {
+    setBatchPending(plantIndex, true, false);
     return;
   }
-  gPrefetchNext = (plantIndex + 1) % count;
-  gPrefetchRemaining = min(kPrefetchCount, count - 1);
+  if (!gPrefetchEnabled) return;
+  for (int offset = 1; offset <= min(kMinCachedAhead, count - 1); offset++) {
+    const int index = (plantIndex + offset) % count;
+    if (cacheFind(index) < 0 && !gUnavailable[index]) {
+      setBatchPending(index, false, false);
+      return;
+    }
+  }
 }
 
 static void requestImmediate(int plantIndex) {
   if (plantIndex < 0) return;
-  if (cacheFind(plantIndex) >= 0) return;
-  gThumbPending = plantIndex;
-  gThumbPendingSinceMs = millis() - kRequestDebounceMs;
+  gPrefetchEnabled = true;
+  if (cacheFind(plantIndex) < 0 && !gUnavailable[plantIndex]) {
+    setBatchPending(plantIndex, true, true);
+  } else {
+    scheduleRollingPrefetch(plantIndex);
+  }
 }
 
 void agavThumbInit() {
   if (agavPlantCount() <= 0) return;
   const int index = agavPlantIndex();
   requestImmediate(index);
-  schedulePrefetchFrom(index);
 }
 
 void agavThumbShutdown() {
   gThumbPending = -1;
+  gThumbPendingRequired = false;
   gThumbPendingSinceMs = 0;
-  gPrefetchNext = -1;
-  gPrefetchRemaining = 0;
+  gPrefetchEnabled = false;
 }
 
 void agavThumbRequest(int plantIndex) {
   if (plantIndex < 0) return;
+  gPrefetchEnabled = true;
   if (cacheFind(plantIndex) >= 0) {
     const int slot = cacheFind(plantIndex);
     if (slot >= 0) gSlotAge[slot] = ++gSlotTick;
     gThumbPending = -1;
+    gThumbPendingRequired = false;
     gThumbPendingSinceMs = 0;
-    schedulePrefetchFrom(plantIndex);
+    scheduleRollingPrefetch(plantIndex);
     return;
   }
-  gThumbPending = plantIndex;
-  gThumbPendingSinceMs = millis();
-  schedulePrefetchFrom(plantIndex);
+  if (!gUnavailable[plantIndex]) {
+    setBatchPending(plantIndex, true, false);
+  }
+}
+
+void agavThumbStopPrefetch() {
+  gPrefetchEnabled = false;
+  if (!gThumbPendingRequired) {
+    gThumbPending = -1;
+    gThumbPendingSinceMs = 0;
+  }
 }
 
 void agavThumbRequestCacheReset() {
@@ -345,11 +428,60 @@ void agavThumbRequestCacheReset() {
   portEXIT_CRITICAL(&gThumbMux);
 }
 
+static uint16_t readU16(const uint8_t *buf) {
+  return (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
+}
+
+static uint32_t readU32(const uint8_t *buf) {
+  return (uint32_t)buf[0] | ((uint32_t)buf[1] << 8) |
+         ((uint32_t)buf[2] << 16) | ((uint32_t)buf[3] << 24);
+}
+
+static bool decodeBatchToCache(const uint8_t *buf, size_t len,
+                               const int *indexes, int indexCount) {
+  if (!buf || len < 6 || memcmp(buf, "AGB1", 4) != 0) return false;
+  const uint16_t recordCount = readU16(buf + 4);
+  if (recordCount > kBatchSize || recordCount > indexCount) return false;
+  size_t offset = 6;
+  for (uint16_t i = 0; i < recordCount; i++) {
+    if (offset + 8 > len) return false;
+    const uint16_t requestIndex = readU16(buf + offset);
+    const uint16_t status = readU16(buf + offset + 2);
+    const uint32_t bodyLen = readU32(buf + offset + 4);
+    offset += 8;
+    if (requestIndex >= indexCount || bodyLen > kMaxDownloadBytes ||
+        offset + bodyLen > len) {
+      return false;
+    }
+    offset += bodyLen;
+  }
+  if (offset != len) return false;
+
+  offset = 6;
+  for (uint16_t i = 0; i < recordCount; i++) {
+    const uint16_t requestIndex = readU16(buf + offset);
+    const uint16_t status = readU16(buf + offset + 2);
+    const uint32_t bodyLen = readU32(buf + offset + 4);
+    offset += 8;
+    const int plantIndex = indexes[requestIndex];
+    if (status == 200 && bodyLen > 0) {
+      if (!decodeBufferToCache(plantIndex, buf + offset, bodyLen)) {
+        gUnavailable[plantIndex] = true;
+      }
+    } else {
+      gUnavailable[plantIndex] = true;
+    }
+    offset += bodyLen;
+  }
+  return true;
+}
+
 void agavThumbService() {
   bool resetRequested = false;
   uint8_t *resultBuf = nullptr;
   size_t resultLen = 0;
-  int resultIndex = -1;
+  int resultCount = 0;
+  int resultIndexes[kBatchSize] = {};
   uint32_t resultGeneration = 0;
   bool workerRunning = false;
 
@@ -359,11 +491,14 @@ void agavThumbService() {
   if (gThumbResultBuf != nullptr) {
     resultBuf = gThumbResultBuf;
     resultLen = gThumbResultLen;
-    resultIndex = gThumbResultIndex;
+    resultCount = gThumbResultCount;
+    for (int i = 0; i < resultCount; i++) {
+      resultIndexes[i] = gThumbResultIndexes[i];
+    }
     resultGeneration = gThumbResultGeneration;
     gThumbResultBuf = nullptr;
     gThumbResultLen = 0;
-    gThumbResultIndex = -1;
+    gThumbResultCount = 0;
   }
   workerRunning = gThumbWorkerRunning;
   portEXIT_CRITICAL(&gThumbMux);
@@ -371,25 +506,22 @@ void agavThumbService() {
   if (resetRequested) {
     gCacheGeneration++;
     cacheFreeAll();
+    memset(gUnavailable, 0, sizeof(gUnavailable));
     gThumbPending = -1;
-    gPrefetchNext = -1;
-    gPrefetchRemaining = 0;
+    gThumbPendingRequired = false;
+    gPrefetchEnabled = true;
     if (agavPlantCount() > 0) {
       const int index = agavPlantIndex();
       requestImmediate(index);
-      schedulePrefetchFrom(index);
     }
   }
 
   if (resultBuf) {
     if (resultGeneration == gCacheGeneration) {
-      if (decodeBufferToCache(resultIndex, resultBuf, resultLen) &&
-          gThumbPending == resultIndex) {
-        gThumbPending = -1;
-        gThumbPendingSinceMs = 0;
-      }
+      decodeBatchToCache(resultBuf, resultLen, resultIndexes, resultCount);
     }
     free(resultBuf);
+    scheduleRollingPrefetch(agavPlantIndex());
   }
 
   if (workerRunning) return;
@@ -397,17 +529,8 @@ void agavThumbService() {
     if (millis() - gThumbPendingSinceMs < kRequestDebounceMs) return;
     const int index = gThumbPending;
     gThumbPending = -1;
-    startThumbDownload(index);
-    return;
-  }
-
-  while (gPrefetchRemaining > 0 && gPrefetchNext >= 0) {
-    const int index = gPrefetchNext;
-    const int count = agavPlantCount();
-    gPrefetchNext = count > 0 ? (gPrefetchNext + 1) % count : -1;
-    gPrefetchRemaining--;
-    if (cacheFind(index) >= 0) continue;
-    if (startThumbDownload(index)) return;
+    gThumbPendingRequired = false;
+    startThumbBatch(index);
   }
 }
 

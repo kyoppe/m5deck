@@ -10,6 +10,7 @@
 #include <time.h>
 
 #include "secrets.h"
+#include "agav_network.h"
 #include "agavydration.h"
 #include "agav_ui.h"
 #include "agav_thumb.h"
@@ -1782,6 +1783,7 @@ void setup() {
   canvas.createSprite(M5.Display.width(), M5.Display.height());
 
   computeLayout();
+  agavNetworkInit();
   syncTime();
   agavStartPlantPreload();
 

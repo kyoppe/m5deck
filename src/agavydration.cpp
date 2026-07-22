@@ -7,6 +7,7 @@
 #include <math.h>
 #include <stdarg.h>
 
+#include "agav_network.h"
 #include "agav_tls.h"
 #include "agav_thumb.h"
 #include "secrets.h"
@@ -150,6 +151,7 @@ static void agavEnterSelect(float weightG) {
   agavSendStateN = AGAV_SEND_NONE;
   agavSetStatus("pick plant");
   agavThumbRequest(agavPlantIndexN);
+  agavThumbStopPrefetch();
   Serial.printf("agav ready to record %.0fg\n", weightG);
 }
 
@@ -192,6 +194,12 @@ static bool agavFetchPlants(bool reload) {
   if (WiFi.status() != WL_CONNECTED) {
     agavApiStateN = AGAV_API_ERROR;
     agavSetStatus("WiFi offline");
+    return false;
+  }
+  AgavNetworkGuard network(20000);
+  if (!network) {
+    agavApiStateN = AGAV_API_ERROR;
+    agavSetStatus("Network busy");
     return false;
   }
 
@@ -350,6 +358,12 @@ static bool agavPostReading(int weightG, int plantIndex) {
   if (WiFi.status() != WL_CONNECTED) {
     agavSendStateN = AGAV_SEND_FAIL;
     agavSetStatus("WiFi offline");
+    return false;
+  }
+  AgavNetworkGuard network(5000);
+  if (!network) {
+    agavSendStateN = AGAV_SEND_FAIL;
+    agavSetStatus("Network busy");
     return false;
   }
 
