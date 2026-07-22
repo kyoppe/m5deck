@@ -1827,7 +1827,7 @@ void loop() {
     if (calMode) {
       exitCalMode();
     } else if (weightMode) {
-      if (!agavIsSelectMode() && !agavIsSentMode()) {
+      if (!agavIsSelectMode() && !agavIsSentMode() && !agavIsSendingMode()) {
         agavRefreshPlants();
       }
       weightLastActivityMs = ms;
@@ -1847,11 +1847,11 @@ void loop() {
         weightLastActivityMs = ms;
         forceDraw = true;
       }
-    } else if (!agavIsSentMode() && M5.BtnB.wasHold()) {
+    } else if (!agavIsSentMode() && !agavIsSendingMode() && M5.BtnB.wasHold()) {
       enterCalMode();
       weightLastActivityMs = ms;
       forceDraw = true;
-    } else if (!agavIsSentMode() && M5.BtnB.wasClicked()) {
+    } else if (!agavIsSentMode() && !agavIsSendingMode() && M5.BtnB.wasClicked()) {
       beginScaleZero(true, false);
       weightLastActivityMs = ms;
       forceDraw = true;
@@ -2074,17 +2074,20 @@ void loop() {
 
   if (weightMode &&
       (calMode || weightLoadState == WLS_LOADED || agavIsSelectMode() ||
-       agavIsSentMode())) {
+       agavIsSendingMode() || agavIsSentMode())) {
     weightLastActivityMs = ms;
   }
   if (weightMode && !calMode && weightLoadState == WLS_IDLE &&
-      !agavIsSelectMode() && !agavIsSentMode() &&
+      !agavIsSelectMode() && !agavIsSendingMode() && !agavIsSentMode() &&
       ms - weightLastActivityMs >= WEIGHT_MODE_TIMEOUT_MS) {
     exitWeightMode();
     forceDraw = true;
   }
 
   // 重量モード中は時計の代わりに重量/キャリブ画面を表示
+  if (agavEnabled() && agavHasPlants() && !weightMode) {
+    agavThumbService();
+  }
   if (weightMode) {
     if (scaleZeroActive() && !calMode) {
       serviceScaleZero(ms);

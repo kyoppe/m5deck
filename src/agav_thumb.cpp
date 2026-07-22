@@ -29,11 +29,10 @@ static constexpr int kThumbPx = 96;
 static constexpr size_t kMaxDownloadBytes = 65536;
 static constexpr size_t kMaxBatchBytes =
     6 + 8 * (8 + kMaxDownloadBytes);
-static constexpr int kCacheSlots = 12;
+static constexpr int kCacheSlots = AGAV_MAX_PLANTS;
 static constexpr uint32_t kRequestDebounceMs = 80;
 static constexpr uint32_t kDownloadTimeoutMs = 4000;
 static constexpr int kBatchSize = 8;
-static constexpr int kMinCachedAhead = 4;
 
 struct ThumbSlot {
   int index = -1;
@@ -230,27 +229,19 @@ static int cacheFind(int index) {
 static int cacheAlloc(int index) {
   int slot = cacheFind(index);
   if (slot >= 0) return slot;
-  slot = 0;
-  uint32_t oldest = UINT32_MAX;
-  bool foundUnprotected = false;
-  const int current = agavPlantIndex();
-  const int plantCount = agavPlantCount();
+
   for (int i = 0; i < kCacheSlots; i++) {
     if (!gSlots[i].ready) {
-      slot = i;
-      break;
+      gSlots[i].index = index;
+      gSlots[i].ready = false;
+      return i;
     }
-    const int forwardDistance =
-        plantCount > 0
-            ? (gSlots[i].index - current + plantCount) % plantCount
-            : kMinCachedAhead + 1;
-    const bool protectedSlot =
-        forwardDistance >= 0 && forwardDistance <= kMinCachedAhead;
-    if (!protectedSlot && (!foundUnprotected || gSlotAge[i] < oldest)) {
-      foundUnprotected = true;
-      oldest = gSlotAge[i];
-      slot = i;
-    } else if (!foundUnprotected && gSlotAge[i] < oldest) {
+  }
+
+  slot = 0;
+  uint32_t oldest = gSlotAge[0];
+  for (int i = 1; i < kCacheSlots; i++) {
+    if (gSlotAge[i] < oldest) {
       oldest = gSlotAge[i];
       slot = i;
     }
@@ -308,25 +299,78 @@ static void thumbDownloadTask(void *) {
   vTaskDelete(nullptr);
 }
 
-static bool startThumbBatch(int startIndex) {
+static bool appendThumbToJob(ThumbDownloadJob &job, int index) {
+  if (cacheFind(index) >= 0 || gUnavailable[index]) return false;
+  for (int i = 0; i < job.count; i++) {
+    if (job.indexes[i] == index) return false;
+  }
+  char path[sizeof(job.paths[0])];
+  if (!agavPlantThumbPath(index, path, sizeof(path))) {
+    gUnavailable[index] = true;
+    return false;
+  }
+  job.indexes[job.count] = index;
+  snprintf(job.paths[job.count], sizeof(job.paths[job.count]), "%s", path);
+  job.count++;
+  return true;
+}
+
+static void fillBatchAroundCenter(int centerIndex, ThumbDownloadJob &job) {
+  const int plantCount = agavPlantCount();
+  if (plantCount <= 0 || centerIndex < 0) return;
+
+  job.generation = gCacheGeneration;
+  for (int step = 0; step < plantCount && job.count < kBatchSize; step++) {
+    int offset = 0;
+    if (step == 0) {
+      offset = 0;
+    } else {
+      const int ring = (step + 1) / 2;
+      offset = (step % 2 == 1) ? ring : -ring;
+    }
+    const int index = (centerIndex + offset + plantCount) % plantCount;
+    appendThumbToJob(job, index);
+  }
+}
+
+static bool hasMissingThumbs() {
+  const int plantCount = agavPlantCount();
+  for (int i = 0; i < plantCount; i++) {
+    if (cacheFind(i) < 0 && !gUnavailable[i]) return true;
+  }
+  return false;
+}
+
+static void setBatchPending(int startIndex, bool required, bool immediate) {
+  if (startIndex < 0) return;
+  if (gThumbPending >= 0 && gThumbPendingRequired && !required) return;
+  gThumbPending = startIndex;
+  gThumbPendingRequired = required;
+  gThumbPendingSinceMs =
+      immediate ? millis() - kRequestDebounceMs : millis();
+}
+
+static void schedulePrefetch(int plantIndex) {
+  const int count = agavPlantCount();
+  if (count <= 0) return;
+  const int center = plantIndex >= 0 ? plantIndex : agavPlantIndex();
+  if (center < 0) return;
+
+  if (cacheFind(center) < 0 && !gUnavailable[center]) {
+    setBatchPending(center, false, false);
+    return;
+  }
+  if (!gPrefetchEnabled) return;
+  if (!hasMissingThumbs()) return;
+  setBatchPending(center, false, false);
+}
+
+static bool startThumbBatchAt(int centerIndex) {
   const int plantCount = agavPlantCount();
   if (plantCount <= 0) return false;
 
   ThumbDownloadJob job;
-  job.generation = gCacheGeneration;
-  for (int offset = 0;
-       offset < plantCount && job.count < kBatchSize; offset++) {
-    const int index = (startIndex + offset) % plantCount;
-    if (cacheFind(index) >= 0 || gUnavailable[index]) continue;
-    char path[sizeof(job.paths[0])];
-    if (!agavPlantThumbPath(index, path, sizeof(path))) {
-      gUnavailable[index] = true;
-      continue;
-    }
-    job.indexes[job.count] = index;
-    snprintf(job.paths[job.count], sizeof(job.paths[job.count]), "%s", path);
-    job.count++;
-  }
+  fillBatchAroundCenter(centerIndex, job);
   if (job.count == 0) return false;
 
   portENTER_CRITICAL(&gThumbMux);
@@ -348,30 +392,8 @@ static bool startThumbBatch(int startIndex) {
   return false;
 }
 
-static void setBatchPending(int startIndex, bool required, bool immediate) {
-  if (startIndex < 0) return;
-  if (gThumbPending >= 0 && gThumbPendingRequired && !required) return;
-  gThumbPending = startIndex;
-  gThumbPendingRequired = required;
-  gThumbPendingSinceMs =
-      immediate ? millis() - kRequestDebounceMs : millis();
-}
-
 static void scheduleRollingPrefetch(int plantIndex) {
-  const int count = agavPlantCount();
-  if (count <= 0 || plantIndex < 0) return;
-  if (cacheFind(plantIndex) < 0 && !gUnavailable[plantIndex]) {
-    setBatchPending(plantIndex, true, false);
-    return;
-  }
-  if (!gPrefetchEnabled) return;
-  for (int offset = 1; offset <= min(kMinCachedAhead, count - 1); offset++) {
-    const int index = (plantIndex + offset) % count;
-    if (cacheFind(index) < 0 && !gUnavailable[index]) {
-      setBatchPending(index, false, false);
-      return;
-    }
-  }
+  schedulePrefetch(plantIndex);
 }
 
 static void requestImmediate(int plantIndex) {
@@ -386,8 +408,8 @@ static void requestImmediate(int plantIndex) {
 
 void agavThumbInit() {
   if (agavPlantCount() <= 0) return;
-  const int index = agavPlantIndex();
-  requestImmediate(index);
+  gPrefetchEnabled = true;
+  requestImmediate(agavPlantIndex());
 }
 
 void agavThumbShutdown() {
@@ -410,7 +432,7 @@ void agavThumbRequest(int plantIndex) {
     return;
   }
   if (!gUnavailable[plantIndex]) {
-    setBatchPending(plantIndex, true, false);
+    setBatchPending(plantIndex, true, true);
   }
 }
 
@@ -530,7 +552,7 @@ void agavThumbService() {
     const int index = gThumbPending;
     gThumbPending = -1;
     gThumbPendingRequired = false;
-    startThumbBatch(index);
+    startThumbBatchAt(index);
   }
 }
 

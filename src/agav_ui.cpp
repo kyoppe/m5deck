@@ -14,6 +14,48 @@ static constexpr uint8_t WATERMARK_ALPHA = 48;
 static M5Canvas watermarkSprite(&M5.Display);
 static bool watermarkReady = false;
 
+static void drawStatusHeadline(M5Canvas &c, const char *text, int cx, int cy,
+                               uint16_t fg, uint16_t bg) {
+  const lgfx::IFont *font = &fonts::FreeSansBold24pt7b;
+  c.setFont(font);
+  c.setTextSize(1.0f);
+  if (c.textWidth(text) > c.width() - 16) {
+    font = &fonts::FreeSansBold18pt7b;
+    c.setFont(font);
+  }
+  c.setTextDatum(middle_center);
+  c.setTextColor(fg, bg);
+  c.drawString(text, cx, cy);
+}
+
+static void drawCenterWeightGrams(M5Canvas &c, int grams, int cx, int cy,
+                                  uint16_t fg, uint16_t unitFg, uint16_t bg) {
+  char value[16];
+  snprintf(value, sizeof(value), "%d", grams);
+  constexpr int kUnitGap = 6;
+  constexpr float kUnitScale = 0.42f;
+
+  c.setFont(&fonts::FreeSansBold24pt7b);
+  c.setTextSize(1.0f);
+  const int numW = c.textWidth(value);
+  c.setFont(&fonts::FreeSansBold12pt7b);
+  c.setTextSize(1.0f);
+  const int unitW = c.textWidth("g");
+  const int totalW = numW + kUnitGap + (int)(unitW * kUnitScale);
+
+  int left = cx - totalW / 2;
+  c.setFont(&fonts::FreeSansBold24pt7b);
+  c.setTextSize(1.0f);
+  c.setTextDatum(middle_left);
+  c.setTextColor(fg, bg);
+  c.drawString(value, left, cy);
+
+  c.setFont(&fonts::FreeSansBold12pt7b);
+  c.setTextSize(kUnitScale);
+  c.setTextColor(unitFg, bg);
+  c.drawString("g", left + numW + kUnitGap, cy + 6);
+}
+
 static void drawScaledCenterText(M5Canvas &c, const char *text, int cx, int cy,
                                 float targetH, uint16_t fg, uint16_t bg) {
   c.setFont(&fonts::Font4);
@@ -183,16 +225,17 @@ static void drawPlantRow(M5Canvas &c, int cardX, int cardY, int cardW,
   c.drawString(counter, textX, cardY + cardH - 8);
 }
 
-static void renderSent(M5Canvas &c, uint32_t nowMs) {
+static void renderSending(M5Canvas &c, uint32_t nowMs) {
   const int W = c.width();
-  const int H = c.height();
   c.fillScreen(AGAV_BG);
 
-  char sentBuf[16];
-  snprintf(sentBuf, sizeof(sentBuf), "%d", agavSentBannerWeight());
-  drawScaledCenterText(c, "SENT", W / 2, 50, 32.0f, AGAV_SAGE_GLOW, AGAV_BG);
-  drawScaledCenterWeight(c, sentBuf, W / 2, 96, 60.0f, AGAV_INK, AGAV_INK_MUTED,
-                         AGAV_BG);
+  static const char *kDots[] = {"", ".", "..", "..."};
+  const int dotPhase = (int)((nowMs / 400U) % 4U);
+  char title[20];
+  snprintf(title, sizeof(title), "Sending%s", kDots[dotPhase]);
+  drawStatusHeadline(c, title, W / 2, 50, AGAV_SAND, AGAV_BG);
+  drawCenterWeightGrams(c, agavSentBannerWeight(), W / 2, 96, AGAV_INK,
+                        AGAV_INK_MUTED, AGAV_BG);
 
   const int cardW = W - 8;
   const int cardH = 96;
@@ -202,7 +245,26 @@ static void renderSent(M5Canvas &c, uint32_t nowMs) {
                agavSentBannerPlantIndex(), agavSentBannerPlantIndex() + 1,
                agavPlantCount());
 
-  drawFooter(c, "", "lift pot", AGAV_BG);
+  drawFooter(c, "", "", AGAV_BG);
+}
+
+static void renderSent(M5Canvas &c, uint32_t nowMs) {
+  const int W = c.width();
+  c.fillScreen(AGAV_BG);
+
+  drawStatusHeadline(c, "Sent", W / 2, 50, AGAV_SAGE_GLOW, AGAV_BG);
+  drawCenterWeightGrams(c, agavSentBannerWeight(), W / 2, 96, AGAV_INK,
+                        AGAV_INK_MUTED, AGAV_BG);
+
+  const int cardW = W - 8;
+  const int cardH = 96;
+  const int cardX = 4;
+  const int cardY = 120;
+  drawPlantRow(c, cardX, cardY, cardW, cardH, agavSentBannerLabel(),
+               agavSentBannerPlantIndex(), agavSentBannerPlantIndex() + 1,
+               agavPlantCount());
+
+  drawFooter(c, "", "Lift pot", AGAV_BG);
   (void)nowMs;
 }
 
@@ -224,6 +286,14 @@ static void renderSelect(M5Canvas &c, const AgavWeightView &view) {
   const int cardY = 47;
   drawPlantRow(c, cardX, cardY, cardW, cardH, agavSelectedLabel(),
                agavPlantIndex(), agavPlantIndex() + 1, agavPlantCount());
+
+  if (agavSendState() == AGAV_SEND_FAIL) {
+    c.setFont(&fonts::FreeSansBold12pt7b);
+    c.setTextSize(1.0f);
+    c.setTextDatum(middle_center);
+    c.setTextColor(AGAV_RUST, AGAV_BG);
+    c.drawString(agavStatusLine(), W / 2, cardY + cardH + 18);
+  }
 
   drawFooter(c, "A: cancel", "B: record", AGAV_BG);
   (void)view;
@@ -301,6 +371,10 @@ void agavRenderWeightScreen(M5Canvas &canvas, const AgavWeightView &view,
                             uint32_t nowMs) {
   if (agavEnabled() && agavSentBannerActive(nowMs)) {
     renderSent(canvas, nowMs);
+    return;
+  }
+  if (agavEnabled() && agavIsSendingMode()) {
+    renderSending(canvas, nowMs);
     return;
   }
   if (agavEnabled() && agavIsSelectMode()) {

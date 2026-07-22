@@ -11,6 +11,7 @@ enum AgavUiState {
   AGAV_UI_MEASURING = 0,
   AGAV_UI_SELECT_PLANT = 1,
   AGAV_UI_SENT = 2,
+  AGAV_UI_SENDING = 3,
 };
 
 enum AgavApiState {
@@ -42,6 +43,7 @@ bool agavPlantThumbPath(int index, char *out, size_t outLen);
 
 bool agavHasPlants();
 bool agavIsSelectMode();
+bool agavIsSendingMode();
 bool agavIsSentMode();
 bool agavIsStabilizing();
 int agavPlantCount();

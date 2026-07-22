@@ -45,6 +45,9 @@ static portMUX_TYPE agavFetchMux = portMUX_INITIALIZER_UNLOCKED;
 static portMUX_TYPE agavStatusMux = portMUX_INITIALIZER_UNLOCKED;
 static bool agavFetchInProgressN = false;
 static bool agavFetchIsReloadN = false;
+static volatile bool agavSendInProgressN = false;
+static int agavPendingSendWeightG = 0;
+static int agavPendingSendPlantIndex = -1;
 static uint32_t agavStatusHoldUntilN = 0;
 static char agavStatusBuf[64] = "";
 static char agavStatusReadBuf[64] = "";
@@ -128,6 +131,19 @@ static const char *agavPlantDisplayName(const AgavPlantEntry &plant) {
   if (plant.nickname.length() > 0) return plant.nickname.c_str();
   if (plant.label.length() > 0) return plant.label.c_str();
   return plant.id.c_str();
+}
+
+static void agavEnterSending(int weightG, int plantIndex) {
+  const AgavPlantSnapshot snapshot = agavPlantSnapshot();
+  agavUiStateN = AGAV_UI_SENDING;
+  agavSentBannerWeightG = weightG;
+  agavSentPlantIndex = plantIndex;
+  snprintf(agavSentPlantLabel, sizeof(agavSentPlantLabel), "%s",
+           plantIndex >= 0 && plantIndex < snapshot.count
+               ? agavPlantDisplayName(snapshot.plants[plantIndex])
+               : "");
+  agavSendStateN = AGAV_SEND_PENDING;
+  agavSetStatus("sending...");
 }
 
 static void agavEnterSent(int weightG, int plantIndex) {
@@ -385,9 +401,6 @@ static bool agavPostReading(int weightG, int plantIndex) {
   agavAddAuthHeader(http);
   http.addHeader("Content-Type", "application/json");
   http.setTimeout(10000);
-  agavSendStateN = AGAV_SEND_PENDING;
-  agavSetStatus("sending...");
-
   const int code = http.POST((uint8_t *)body, strlen(body));
   String resp = http.getString();
   http.end();
@@ -476,14 +489,41 @@ void agavNextPlant() {
   agavThumbRequest(index);
 }
 
+static void agavSendTask(void *param) {
+  (void)param;
+  const int weightG = agavPendingSendWeightG;
+  const int plantIndex = agavPendingSendPlantIndex;
+  const bool ok = agavPostReading(weightG, plantIndex);
+  if (ok) {
+    agavEnterSent(weightG, plantIndex);
+  } else {
+    agavUiStateN = AGAV_UI_SELECT_PLANT;
+  }
+  agavSendInProgressN = false;
+  vTaskDelete(nullptr);
+}
+
 void agavConfirmSend() {
   if (agavUiStateN != AGAV_UI_SELECT_PLANT) return;
+  if (agavSendInProgressN) return;
   const AgavPlantSnapshot snapshot = agavPlantSnapshot();
   if (snapshot.count == 0) return;
   const int weightG = (int)lroundf(agavFrozenWeightG);
   if (weightG <= 0) return;
-  if (agavPostReading(weightG, snapshot.index)) {
-    agavEnterSent(weightG, snapshot.index);
+
+  agavPendingSendWeightG = weightG;
+  agavPendingSendPlantIndex = snapshot.index;
+  agavEnterSending(weightG, snapshot.index);
+  agavSendInProgressN = true;
+  agavThumbStopPrefetch();
+
+  const BaseType_t created = xTaskCreatePinnedToCore(
+      agavSendTask, "agav-send", 12288, nullptr, 1, nullptr, 0);
+  if (created != pdPASS) {
+    agavSendInProgressN = false;
+    agavUiStateN = AGAV_UI_SELECT_PLANT;
+    agavSendStateN = AGAV_SEND_FAIL;
+    agavSetStatus("send task fail");
   }
 }
 
@@ -518,6 +558,8 @@ void agavTick(uint32_t nowMs, float displayG, bool loaded) {
     }
     return;
   }
+
+  if (agavUiStateN == AGAV_UI_SENDING) return;
 
   if (agavUiStateN == AGAV_UI_SELECT_PLANT) {
     if (!loaded) agavCancelSelect();
@@ -557,6 +599,7 @@ void agavTick(uint32_t nowMs, float displayG, bool loaded) {
 
 bool agavHasPlants() { return agavPlantSnapshot().count > 0; }
 bool agavIsSelectMode() { return agavUiStateN == AGAV_UI_SELECT_PLANT; }
+bool agavIsSendingMode() { return agavUiStateN == AGAV_UI_SENDING; }
 bool agavIsSentMode() { return agavUiStateN == AGAV_UI_SENT; }
 bool agavIsStabilizing() {
   return agavUiStateN == AGAV_UI_MEASURING && agavStableSinceMs != 0;
