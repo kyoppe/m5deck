@@ -20,15 +20,27 @@
 #define DD_SITE "datadoghq.com"
 #endif
 #ifndef AGAV_METRIC_PREFIX
-#define AGAV_METRIC_PREFIX "test.kyouhei.iot"
+#define AGAV_METRIC_PREFIX "kyouhei.iot"
+#endif
+#ifndef AGAV_CPU_METRIC_PREFIX
+#define AGAV_CPU_METRIC_PREFIX "test.kyouhei.iot"
 #endif
 #ifndef M5DECK_VERSION
 #define M5DECK_VERSION "dev"
 #endif
 
 static constexpr uint32_t kMetricsIntervalMs = 15000;
-static constexpr uint64_t kIdleSampleMinUs = 100;
 static constexpr const char *kDeviceTag = "device:m5deck";
+static constexpr int kUsbVbusPresentMv = 4000;
+
+static bool metricsUsbConnected() {
+  const int vbus = M5.Power.getVBUSVoltage();
+  return vbus > kUsbVbusPresentMv;
+}
+
+static bool metricsBatteryCharging() {
+  return M5.Power.isCharging() == m5::Power_Class::is_charging_t::is_charging;
+}
 
 static portMUX_TYPE g_idleMux = portMUX_INITIALIZER_UNLOCKED;
 static volatile uint64_t g_idleUs[2] = {0, 0};
@@ -39,7 +51,7 @@ static bool idleHookCore0() {
   const uint64_t now = esp_timer_get_time();
   portENTER_CRITICAL(&g_idleMux);
   const uint64_t last = g_idleLastUs[0];
-  if (last != 0 && now - last >= kIdleSampleMinUs) {
+  if (last != 0) {
     g_idleUs[0] += now - last;
   }
   g_idleLastUs[0] = now;
@@ -51,7 +63,7 @@ static bool idleHookCore1() {
   const uint64_t now = esp_timer_get_time();
   portENTER_CRITICAL(&g_idleMux);
   const uint64_t last = g_idleLastUs[1];
-  if (last != 0 && now - last >= kIdleSampleMinUs) {
+  if (last != 0) {
     g_idleUs[1] += now - last;
   }
   g_idleLastUs[1] = now;
@@ -153,7 +165,10 @@ static bool agavMetricsSend(uint64_t windowUs) {
   const int32_t batteryLevel = M5.Power.getBatteryLevel();
   const float batteryPct =
       batteryLevel < 0 ? 0.0f : static_cast<float>(batteryLevel);
-  const bool charging = M5.Power.isCharging();
+  const bool usbConnected = metricsUsbConnected();
+  const bool charging = metricsBatteryCharging();
+  const char *usbTag =
+      usbConnected ? "usb_connected:true" : "usb_connected:false";
   const char *chargingTag = charging ? "charging:true" : "charging:false";
 
   char metricRunning[64];
@@ -162,7 +177,8 @@ static bool agavMetricsSend(uint64_t windowUs) {
   char metricBattery[64];
   snprintf(metricRunning, sizeof(metricRunning), "%s.device.running",
            AGAV_METRIC_PREFIX);
-  snprintf(metricCpu, sizeof(metricCpu), "%s.cpu.user", AGAV_METRIC_PREFIX);
+  snprintf(metricCpu, sizeof(metricCpu), "%s.cpu.user",
+           AGAV_CPU_METRIC_PREFIX);
   snprintf(metricMemory, sizeof(metricMemory), "%s.memory.pct_usable",
            AGAV_METRIC_PREFIX);
   snprintf(metricBattery, sizeof(metricBattery), "%s.battery.pct",
@@ -182,6 +198,7 @@ static bool agavMetricsSend(uint64_t windowUs) {
     JsonArray tags = item["tags"].to<JsonArray>();
     tags.add(kDeviceTag);
     tags.add(g_versionTag);
+    tags.add(usbTag);
   }
 
   {
@@ -222,6 +239,7 @@ static bool agavMetricsSend(uint64_t windowUs) {
     JsonArray tags = item["tags"].to<JsonArray>();
     tags.add(kDeviceTag);
     tags.add(g_versionTag);
+    tags.add(usbTag);
     tags.add(chargingTag);
   }
 
@@ -267,6 +285,6 @@ void agavMetricsStart() {
     return;
   }
 
-  Serial.printf("metrics: started prefix=%s version=%s\n", AGAV_METRIC_PREFIX,
-                M5DECK_VERSION);
+  Serial.printf("metrics: started prefix=%s cpu_prefix=%s version=%s\n",
+                AGAV_METRIC_PREFIX, AGAV_CPU_METRIC_PREFIX, M5DECK_VERSION);
 }

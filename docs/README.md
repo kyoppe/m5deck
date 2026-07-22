@@ -8,6 +8,8 @@
 |-------------|------|
 | [agavydration.md](agavydration.md) | 重量計測と Agavydration への送信 |
 | [datadog-metrics.md](datadog-metrics.md) | Datadog カスタムメトリクス (死活・CPU・メモリ・バッテリー) |
+| [display-power.md](display-power.md) | バッテリー時の Dim / Sleep とタッチ復帰 |
+| [battery-runtime-test.md](battery-runtime-test.md) | バッテリー稼働時間の Datadog 計測手順 |
 | [legacy-extras.md](legacy-extras.md) | ビルドから除外中の機能 (アラートサイレン・カレンダー通知など) |
 
 ## ソースとドキュメントの対応

@@ -17,30 +17,40 @@ Core2 の死活とデバイスヘルスを、**15 秒間隔**で Datadog Metrics
 
 ## メトリクス (現在のプレフィックス)
 
-ビルドフラグ `AGAV_METRIC_PREFIX` で名前空間を切り替えます。本番投入前は **`test.kyouhei.iot`** (テスト用)。
+| メトリクス | プレフィックス | 型 | 値 | タグ |
+|-----------|----------------|-----|-----|------|
+| `device.running` | `AGAV_METRIC_PREFIX` (`kyouhei.iot`) | gauge | `1` | `device:m5deck`, `version:<git-sha>`, `usb_connected:true/false` |
+| `cpu.user` | `AGAV_CPU_METRIC_PREFIX` (`test.kyouhei.iot`) | gauge | 0-100 (2 コア平均) | 上記 + `num_cores:2` |
+| `memory.pct_usable` | `AGAV_METRIC_PREFIX` | gauge | 0-100 | `device:m5deck`, `version:<git-sha>` |
+| `battery.pct` | `AGAV_METRIC_PREFIX` | gauge | 0-100 | 上記 + `usb_connected`, `charging:true/false` |
 
-| メトリクス | 型 | 値 | タグ |
-|-----------|-----|-----|------|
-| `{prefix}.device.running` | gauge | `1` | `device:m5deck`, `version:<git-sha>` |
-| `{prefix}.cpu.user` | gauge | 0-100 (2 コア平均) | 上記 + `num_cores:2` |
-| `{prefix}.memory.pct_usable` | gauge | 0-100 | `device:m5deck`, `version:<git-sha>` |
-| `{prefix}.battery.pct` | gauge | 0-100 | 上記 + `charging:true` / `charging:false` |
+CPU 検証中は `cpu.user` だけ `test.kyouhei.iot` に残し、他は本番 `kyouhei.iot` です。
+
+### 電源タグ
+
+| タグ | 判定 |
+|------|------|
+| `usb_connected` | `VBUS > 4V` (ケーブル接続。満充電で充電停止中も `true`) |
+| `charging` | PMIC が充電中と報告 (`usb_connected:true` + `charging:false` = 接続のみ) |
+
+`cpu.user` / `memory.pct_usable` には電源タグを付けません。
 
 例 (テスト中):
 
 ```
-test.kyouhei.iot.device.running
+kyouhei.iot.device.running
 test.kyouhei.iot.cpu.user
-test.kyouhei.iot.memory.pct_usable
-test.kyouhei.iot.battery.pct
+kyouhei.iot.memory.pct_usable
+kyouhei.iot.battery.pct
 ```
 
-### プレフィックスを本番に切り替える
+### プレフィックスを変更する
 
 `platformio.ini`:
 
 ```ini
--DAGAV_METRIC_PREFIX=\"kyouhei.iot\"
+-DAGAV_METRIC_PREFIX=\"your.prefix\"
+-DAGAV_CPU_METRIC_PREFIX=\"your.prefix.cpu-test\"
 ```
 
 再ビルド・書き込み後、Datadog 上は別メトリクス名になります。モニターも合わせて更新してください。
@@ -58,7 +68,7 @@ Header: DD-API-KEY: <DD_API_KEY>
 
 Linux の `system.cpu.user` と同様、**ホスト全体で 0-100%** です。
 
-- core0 / core1 のアイドルフックで 100µs 間隔サンプリング
+- core0 / core1 のアイドルフックで idle 時間を積算 (呼び出し間隔の閾値なし)
 - 15 秒ウィンドウの平均: `cpu.user = 100 - (idle0% + idle1%) / 2`
 - `num_cores:2` は `cpu.user` のみ (メタデータタグ)
 
@@ -75,7 +85,7 @@ Linux の `system.cpu.user` と同様、**ホスト全体で 0-100%** です。
 ## モニター例
 
 ```
-avg(last_1m):test.kyouhei.iot.device.running{device:m5deck} < 1
+avg(last_1m):kyouhei.iot.device.running{device:m5deck} < 1
 ```
 
 プレフィックス変更後は `kyouhei.iot.device.running` に読み替えてください。
@@ -100,6 +110,7 @@ avg(last_1m):test.kyouhei.iot.device.running{device:m5deck} < 1
 - HTTP は `AgavNetworkGuard` 経由 (agavydration / サムネイルと共有 mutex)
 - [cloud/README.md](../cloud/README.md) のアラート Worker とは **別経路** (デバイスから Metrics API 直 POST)
 - 画面への Query Value 表示は未実装 (ロードマップ)
+- バッテリー駆動時間の計測手順: [battery-runtime-test.md](battery-runtime-test.md)
 
 ## トラブルシュート
 

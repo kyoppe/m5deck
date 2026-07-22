@@ -57,6 +57,86 @@ static bool ntpOk = false;
 enum Panel { PANEL_DIGITAL = 0, PANEL_ANALOG = 1, PANEL_COUNT = 2 };
 static int currentPanel = PANEL_DIGITAL;
 
+// ---- 表示電源 (バッテリー時 Dim / Sleep) --------------------------------
+enum DisplayPowerState { DISP_AWAKE = 0, DISP_DIM, DISP_SLEEP };
+static DisplayPowerState displayPowerState = DISP_AWAKE;
+static uint32_t displayLastActivityMs = 0;
+static constexpr uint8_t BRIGHTNESS_AWAKE = 110;
+static constexpr uint8_t BRIGHTNESS_DIM = 12;
+static constexpr uint32_t DISPLAY_IDLE_DIM_MS = 45UL * 1000UL;
+static constexpr uint32_t DISPLAY_IDLE_SLEEP_MS = 3UL * 60UL * 1000UL;
+static constexpr uint32_t DISPLAY_USB_IDLE_DIM_MS = 5UL * 60UL * 1000UL;
+static constexpr int DISPLAY_VBUS_USB_MV = 4000;
+
+static bool usbPowerPresent() {
+  const int vbus = M5.Power.getVBUSVoltage();
+  return vbus > DISPLAY_VBUS_USB_MV;
+}
+
+static void displayPowerApply(DisplayPowerState state) {
+  switch (state) {
+    case DISP_AWAKE:
+      M5.Display.setBrightness(BRIGHTNESS_AWAKE);
+      break;
+    case DISP_DIM:
+      M5.Display.setBrightness(BRIGHTNESS_DIM);
+      break;
+    case DISP_SLEEP:
+      M5.Display.setBrightness(0);
+      break;
+  }
+}
+
+static bool displayPowerSetState(DisplayPowerState state) {
+  if (displayPowerState == state) return false;
+  displayPowerState = state;
+  displayPowerApply(state);
+  Serial.printf("display power -> %d (usb=%d)\n", (int)state,
+                usbPowerPresent() ? 1 : 0);
+  return true;
+}
+
+static void displayPowerNoteActivity(uint32_t nowMs) {
+  displayLastActivityMs = nowMs;
+  if (displayPowerState != DISP_AWAKE) {
+    displayPowerSetState(DISP_AWAKE);
+  }
+}
+
+static bool displayPowerTick(uint32_t nowMs, bool clockScreen) {
+  const DisplayPowerState before = displayPowerState;
+  if (!clockScreen) {
+    displayLastActivityMs = nowMs;
+    displayPowerSetState(DISP_AWAKE);
+    return displayPowerState != before;
+  }
+  if (usbPowerPresent()) {
+    const uint32_t idleMs = nowMs - displayLastActivityMs;
+    if (idleMs >= DISPLAY_USB_IDLE_DIM_MS) {
+      displayPowerSetState(DISP_DIM);
+    } else {
+      displayPowerSetState(DISP_AWAKE);
+    }
+    return displayPowerState != before;
+  }
+  const uint32_t idleMs = nowMs - displayLastActivityMs;
+  if (idleMs >= DISPLAY_IDLE_DIM_MS + DISPLAY_IDLE_SLEEP_MS) {
+    displayPowerSetState(DISP_SLEEP);
+  } else if (idleMs >= DISPLAY_IDLE_DIM_MS) {
+    displayPowerSetState(DISP_DIM);
+  } else {
+    displayPowerSetState(DISP_AWAKE);
+  }
+  return displayPowerState != before;
+}
+
+// Dim / Sleep 中のタッチは復帰のみ。true = 計量に入らない。
+static bool displayPowerConsumeWakeTouch(uint32_t nowMs) {
+  if (displayPowerState == DISP_AWAKE) return false;
+  displayPowerNoteActivity(nowMs);
+  return true;
+}
+
 // ---- 重量モード（Mini Scales Unit @ I2C 0x26, PORT-A G32/G33）---------
 // ボタンAでON/OFF。重量モード中はBでタレ(ゼロ調整)。
 static constexpr uint8_t MINI_SCALE_ADDR = 0x26;
@@ -1743,6 +1823,7 @@ static void enterWeightMode(uint32_t nowMs) {
   weightMode = true;
   manualTareActive = false;
   weightLastActivityMs = nowMs;
+  displayPowerNoteActivity(nowMs);
   agavOnWeightModeEnter();
   agavStartPlantPreload();
 
@@ -1763,6 +1844,7 @@ static void exitWeightMode() {
   manualTareActive = false;
   agavOnWeightModeExit();
   calMode = false;
+  displayLastActivityMs = millis();
   Serial.println("weight mode -> 0");
 }
 
@@ -1773,8 +1855,9 @@ void setup() {
   M5.BtnB.setHoldThresh(800);  // 長押しでキャリブレーション画面へ
 
   M5.Display.setRotation(1);
-  M5.Display.setBrightness(110);
+  M5.Display.setBrightness(BRIGHTNESS_AWAKE);
   M5.Display.fillScreen(COLOR_BG);
+  displayLastActivityMs = millis();
 
   Serial.begin(115200);
   Serial.println("m5deck: clock panel boot");
@@ -1836,6 +1919,7 @@ void loop() {
       forceDraw = true;
     } else {
       currentPanel = (currentPanel + 1) % PANEL_COUNT;
+      displayPowerNoteActivity(ms);
       Serial.printf("panel -> %d\n", currentPanel);
     }
     forceDraw = true;
@@ -2062,11 +2146,16 @@ void loop() {
     tapped = false;
   }
 
-  // 時計画面のタップで重量モードへ。
+  // 時計画面: Dim/Sleep 中はタッチで復帰のみ。Awake なら重量モードへ。
   if (tapped && !weightMode) {
-    enterWeightMode(ms);
-    forceDraw = true;
-    tapped = false;
+    if (displayPowerConsumeWakeTouch(ms)) {
+      forceDraw = true;
+      tapped = false;
+    } else {
+      enterWeightMode(ms);
+      forceDraw = true;
+      tapped = false;
+    }
   }
 
   if (tapped && weightMode) {
@@ -2140,6 +2229,17 @@ void loop() {
   time_t now = time(nullptr);
   struct tm tm;
   localtime_r(&now, &tm);
+
+  const bool displayStateChanged = displayPowerTick(ms, true);
+  if (displayStateChanged && displayPowerState == DISP_AWAKE) {
+    forceDraw = true;
+  }
+
+  if (displayPowerState == DISP_SLEEP && !forceDraw) {
+    forceDraw = false;
+    delay(50);
+    return;
+  }
 
   if (currentPanel == PANEL_DIGITAL) {
     const bool nextColon = ((ms / 500) % 2) == 0;
