@@ -23,13 +23,12 @@ Constants in `main.cpp`:
 - `DISPLAY_IDLE_DIM_MS` = 45s (battery)
 - `DISPLAY_IDLE_SLEEP_MS` = 3min after dim threshold (battery only)
 - `DISPLAY_USB_IDLE_DIM_MS` = 5min (USB, dim only)
-- `DISPLAY_VBUS_USB_MV` = 4000 (VBUS present = USB connected)
 
 ## USB detection
 
-```cpp
-M5.Power.getVBUSVoltage() > 4000  // mV
-```
+Core2 (AXP192): USB cable = **ACIN** (`M5.Power.Axp192.isACIN()`). Do not use `getVBUSVoltage()`; M-Bus 5V stays up on battery.
+
+Shared helper: `include/agav_power.h` (`agavUsbCableConnected()`), used by display power and Datadog metrics.
 
 When USB is connected:
 

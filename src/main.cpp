@@ -11,6 +11,7 @@
 
 #include "secrets.h"
 #include "agav_network.h"
+#include "agav_power.h"
 #include "agav_metrics.h"
 #include "agavydration.h"
 #include "agav_ui.h"
@@ -66,12 +67,8 @@ static constexpr uint8_t BRIGHTNESS_DIM = 12;
 static constexpr uint32_t DISPLAY_IDLE_DIM_MS = 45UL * 1000UL;
 static constexpr uint32_t DISPLAY_IDLE_SLEEP_MS = 3UL * 60UL * 1000UL;
 static constexpr uint32_t DISPLAY_USB_IDLE_DIM_MS = 5UL * 60UL * 1000UL;
-static constexpr int DISPLAY_VBUS_USB_MV = 4000;
 
-static bool usbPowerPresent() {
-  const int vbus = M5.Power.getVBUSVoltage();
-  return vbus > DISPLAY_VBUS_USB_MV;
-}
+static bool usbPowerPresent() { return agavUsbCableConnected(); }
 
 static void displayPowerApply(DisplayPowerState state) {
   switch (state) {

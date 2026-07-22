@@ -10,6 +10,7 @@
 #include <time.h>
 
 #include "agav_network.h"
+#include "agav_power.h"
 #include "agav_tls.h"
 #include "secrets.h"
 
@@ -33,12 +34,8 @@ static constexpr uint32_t kMetricsIntervalMs = 15000;
 // Gaps longer than this between idle-hook calls mean a non-idle task ran.
 static constexpr uint64_t kIdleMaxGapUs = 3000;
 static constexpr const char *kDeviceTag = "device:m5deck";
-static constexpr int kUsbVbusPresentMv = 4000;
 
-static bool metricsUsbConnected() {
-  const int vbus = M5.Power.getVBUSVoltage();
-  return vbus > kUsbVbusPresentMv;
-}
+static bool metricsUsbConnected() { return agavUsbCableConnected(); }
 
 static bool metricsBatteryCharging() {
   return M5.Power.isCharging() == m5::Power_Class::is_charging_t::is_charging;

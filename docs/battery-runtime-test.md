@@ -31,7 +31,7 @@ All carry `version:<git-sha>` for firmware revision.
 
 1. **Flash** firmware with Dim/Sleep enabled and metrics configured (`secrets.h` `DD_API_KEY`).
 2. **Full charge** or note starting `battery.pct` in Datadog.
-3. **Unplug USB** (VBUS gone). Confirm `usb_connected:false` on `device.running` / `battery.pct`.
+3. **Unplug USB** (ACIN off). Confirm `usb_connected:false` on `device.running` / `battery.pct`.
 4. **Do not touch** the screen (let Dim at 45s, Sleep at ~3m45s unless you change constants).
 5. **Wait** until `device.running` stops (or note time when battery hits 0% if device still runs).
 6. **Record**:

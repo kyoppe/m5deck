@@ -30,7 +30,7 @@ CPU 検証中は `cpu.user` だけ `test.kyouhei.iot` に残し、他は本番 `
 
 | タグ | 判定 |
 |------|------|
-| `usb_connected` | `VBUS > 4V` (ケーブル接続。満充電で充電停止中も `true`) |
+| `usb_connected` | Core2: `AXP192.isACIN()` (USB cable). Other PMIC: `getVBUSVoltage() > 4V` |
 | `charging` | PMIC が充電中と報告 (`usb_connected:true` + `charging:false` = 接続のみ) |
 
 `cpu.user` / `memory.pct_usable` には電源タグを付けません。
