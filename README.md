@@ -1,46 +1,105 @@
 # m5deck
 
-M5Stack Core2 を卓上の情報ダッシュボードにするプロジェクト。
-複数の「パネル（デッキ）」を切り替えて、ひと目で各種情報を確認できることを目指す。
+Desk dashboard firmware for **M5Stack Core2**. Switch between clock panels, weigh plants with a Mini Scales Unit, sync readings to [Agavydration](https://github.com/kyouhei-ohno/agavydration), and push device health metrics to Datadog.
 
-## やりたいこと（ロードマップ）
+Detailed guides (Japanese): [docs/README.md](docs/README.md)
 
-- [x] 開発環境セットアップ（PlatformIO + Arduino + M5Unified）
-- [x] 動作確認用サンプル（画面表示・タッチ・バッテリー・シリアル）
-- [ ] 時計パネル（NTP同期）
-- [ ] SwitchBot API から室温・湿度を取得して表示
-- [ ] Datadog メトリクスを Query Value 風に表示
-- [ ] パネル切り替え UI（タッチ / ボタン）
+## Current features
 
-## 開発環境
+| Area | Status | Notes |
+|------|--------|-------|
+| Digital clock (DSEG7) | Done | NTP + RTC fallback |
+| Analog clock (Muji station style) | Done | Button C toggles panel |
+| Battery overlay | Done | Top-right on both panels |
+| Weight mode + Mini Scales Unit | Done | I2C `0x26`, PORT-A G32/G33 |
+| Agavydration device API | Done | See [docs/agavydration.md](docs/agavydration.md) |
+| Datadog custom metrics (heartbeat) | Done | See [docs/datadog-metrics.md](docs/datadog-metrics.md) |
+| Datadog alert siren (Worker relay) | In tree, **off** | `ENABLE_LEGACY_EXTRAS=0` in `main.cpp` |
+| Google Calendar reminders | In tree, **off** | Same flag |
+| IMU "pick me up" reaction | In tree, **off** | Same flag |
+| SwitchBot temperature/humidity | Planned | |
+| Datadog Query Value on screen | Planned | |
 
-- ハード: M5Stack Core2
-- フレームワーク: Arduino (espressif32)
-- ビルド: PlatformIO Core
-- ライブラリ: [M5Unified](https://github.com/m5stack/M5Unified)
+## Hardware
 
-## セットアップ
+- M5Stack Core2 (ESP32, 320x240 touch LCD)
+- Optional: [Mini Scales Unit](https://docs.m5stack.com/en/unit/miniscales) on PORT-A (SDA=32, SCL=33)
+
+## Quick start
 
 ```bash
-# PlatformIO Core（pipx 経由でインストール済み）
 export PATH="$HOME/.local/bin:$PATH"
 
-# ビルド
+cp include/secrets.h.example include/secrets.h
+# Edit secrets.h (WiFi, Agavydration, Datadog)
+
 pio run
-
-# 書き込み（Core2 を USB-C 接続後）
 pio run -t upload
-
-# シリアルモニタ（115200 bps）
-pio device monitor
+pio device monitor    # 115200 baud
 ```
 
-## ディレクトリ構成
+## Configuration (`include/secrets.h`)
+
+| Define | Purpose |
+|--------|---------|
+| `WIFI_SSID` / `WIFI_PASS` | Station WiFi |
+| `AGAV_API_URL` | Agavydration base URL (e.g. `https://agavydration.pages.dev`) |
+| `AGAV_DEVICE_TOKEN` | Bearer token for `/api/device/*` |
+| `AGAV_CF_ACCESS_*` | Cloudflare Access service token (production HTTPS) |
+| `DD_API_KEY` / `DD_SITE` | Datadog Metrics API v2 (optional; metrics disabled if empty) |
+| `ALERT_WORKER_URL` / `ALERT_DEVICE_TOKEN` | Legacy alert relay (only if `ENABLE_LEGACY_EXTRAS=1`) |
+
+`secrets.h` is gitignored. Use `secrets.h.example` as a template.
+
+## Build flags (`platformio.ini`)
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `AGAV_METRIC_PREFIX` | `test.kyouhei.iot` | Datadog metric namespace (remove `test.` when promoting) |
+| `M5DECK_VERSION` | git short SHA | Injected by `scripts/git_version.py` at build time |
+
+## Repository layout
 
 ```
 m5deck/
-├── platformio.ini   # ビルド・ライブラリ設定
-├── src/main.cpp     # メインスケッチ
-├── include/  lib/  test/
-└── README.md
+├── src/
+│   ├── main.cpp           # Clock panels, weight mode, UI loop
+│   ├── agavydration.*     # Plant list, stable-weight detect, POST readings
+│   ├── agav_thumb.*       # Thumbnail download/cache for plant picker
+│   ├── agav_metrics.*     # Background Datadog metrics (core0, 15s)
+│   ├── agav_network.*     # HTTP mutex across tasks
+│   └── agav_ui.*          # Weight / Agavydration screens
+├── include/
+│   ├── secrets.h.example
+│   └── agav_tls.h         # TLS CA bundles (Cloudflare + Datadog API)
+├── cloud/                 # Datadog alert relay Worker (legacy extras)
+├── docs/                  # Integration and operations guides
+├── scripts/git_version.py
+└── platformio.ini
 ```
+
+## Runtime architecture
+
+- **core1 (Arduino `loop`)**: Display, touch, buttons, weight sampling
+- **core0 (FreeRTOS tasks)**: HTTP (plants fetch, reading POST, thumbnails, metrics)
+- **`AgavNetworkGuard`**: Serializes HTTP so tasks do not overlap
+
+WiFi connects once at boot (`syncTime()`). NTP syncs system time and RTC; clock works from RTC if WiFi fails.
+
+## Cloud components
+
+| Path | Role |
+|------|------|
+| [cloud/README.md](cloud/README.md) | Cloudflare Worker: Datadog monitor webhooks to M5 alert polling (legacy) |
+| [docs/agavydration.md](docs/agavydration.md) | Device-side Agavydration integration |
+| [docs/datadog-metrics.md](docs/datadog-metrics.md) | Outbound metrics and monitoring |
+
+## Roadmap
+
+- [x] PlatformIO + M5Unified setup
+- [x] Clock panels (digital + analog, NTP)
+- [x] Weight mode + Agavydration Phase 2 device API
+- [x] Datadog device metrics (heartbeat, CPU, memory, battery)
+- [ ] SwitchBot indoor temp/humidity panel
+- [ ] On-device Datadog Query Value display
+- [ ] Panel picker UI (touch)

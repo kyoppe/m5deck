@@ -11,6 +11,7 @@
 
 #include "secrets.h"
 #include "agav_network.h"
+#include "agav_metrics.h"
 #include "agavydration.h"
 #include "agav_ui.h"
 #include "agav_thumb.h"
@@ -1786,6 +1787,7 @@ void setup() {
   agavNetworkInit();
   syncTime();
   agavStartPlantPreload();
+  agavMetricsStart();
 
 #if ENABLE_LEGACY_EXTRAS
   // ポーリングは別タスク(core0)で常時実行。メインループ(core1)は止めない。
