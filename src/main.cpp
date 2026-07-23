@@ -148,7 +148,6 @@ static constexpr float WEIGHT_SW_EMA_ALPHA_IDLE = 0.06f;
 static constexpr float WEIGHT_DEADBAND_G = 0.5f;
 static constexpr float WEIGHT_IDLE_DEADBAND_G = 1.2f;
 static constexpr float WEIGHT_WIND_IGNORE_G = 3.5f;
-static constexpr float WEIGHT_ZERO_CLAMP_G = 1.2f;
 static constexpr float WEIGHT_DISPLAY_HOLD_G = 0.35f;
 static constexpr uint32_t WEIGHT_DISPLAY_HOLD_MS = 180;
 static constexpr float WEIGHT_DISPLAY_SNAP_G = 5.0f;
@@ -501,8 +500,13 @@ static bool pollWeight(uint32_t nowMs) {
   const int32_t adcDelta = adcS - scaleZeroAdc;
   weightRawG = miniScaleGramsFromAdcDelta(adcDelta);
   updateWeightLoadState(weightRawG, nowMs);
-  applyWeightFilter(weightRawG, false);
-  if (fabsf(weightGrams) < WEIGHT_ZERO_CLAMP_G) weightGrams = 0.0f;
+  if (weightEmptyStable(weightRawG, nowMs)) {
+    scaleZeroAdc = adcS;
+    weightRawG = 0.0f;
+    applyWeightFilter(0.0f, true);
+  } else {
+    applyWeightFilter(weightRawG, false);
+  }
 
   const float rounded = roundf(weightGrams * 10.0f) / 10.0f;
   const float dispDelta = fabsf(rounded - weightDisplayG);

@@ -27,6 +27,8 @@ M5Stack Core2 + Mini Scales Unit で植物の重量を計測し、[Agavydration]
 |---------|------|------|
 | GET | `/api/device/plants` | 植物一覧 (起動時プリロード、C ボタンで再取得) |
 | POST | `/api/device/readings` | 計量送信 `{"plant_id","weight"}` |
+
+サーバー側 (`recordWeightReading`) では、前回比 **3% 未満かつ 2g 未満の増加**は計測ノイズとして無視し、前回重量を保存します。減少はそのまま記録されます。詳細は [agavydration `docs/design.md`](https://github.com/kyouhei-ohno/agavydration/blob/main/docs/design.md) の「計量ノイズ補正」を参照してください。
 | GET | `/api/device/photos/*` | 選択 UI 用サムネイル (96px) |
 
 認証:
@@ -45,7 +47,7 @@ M5Stack Core2 + Mini Scales Unit で植物の重量を計測し、[Agavydration]
 ### 重量モード
 
 1. スケールに植物を載せる
-2. 表示重量が **2 秒間 ±0.5g 以内**で安定し、**10g 超**なら株選択画面へ
+2. 表示重量が **3 秒間 ±0.5g 以内**で安定し、**10g 超**なら株選択画面へ
 3. タッチ **左 / 右**で植物を切替 (サムネイル表示)
 4. **ボタン B (短押し)**: 送信確定
 5. 送信完了画面のあと、空載に戻ると計量待ちへ
@@ -64,7 +66,7 @@ M5Stack Core2 + Mini Scales Unit で植物の重量を計測し、[Agavydration]
 
 `include/agavydration.h`:
 
-- `AGAV_STABLE_MS` = 2000
+- `AGAV_STABLE_MS` = 3000
 - `AGAV_STABLE_BAND_G` = 0.5
 - `AGAV_MIN_SEND_G` = 10
 

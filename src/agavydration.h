@@ -3,7 +3,7 @@
 #include <Arduino.h>
 
 static constexpr int AGAV_MAX_PLANTS = 48;
-static constexpr uint32_t AGAV_STABLE_MS = 2000;
+static constexpr uint32_t AGAV_STABLE_MS = 3000;
 static constexpr float AGAV_STABLE_BAND_G = 0.5f;
 static constexpr float AGAV_MIN_SEND_G = 10.0f;
 
