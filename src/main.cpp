@@ -2240,7 +2240,7 @@ void loop() {
 
   if (currentPanel == PANEL_DIGITAL) {
     const bool nextColon = ((ms / 500) % 2) == 0;
-    if (forceDraw || ms - lastDraw >= 100 || nextColon != colonOn) {
+    if (forceDraw || ms - lastDraw >= 500 || nextColon != colonOn) {
       lastDraw = ms;
       colonOn = nextColon;
       renderDigital(tm, colonOn);
