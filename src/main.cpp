@@ -1823,6 +1823,7 @@ static void enterWeightMode(uint32_t nowMs) {
   displayPowerNoteActivity(nowMs);
   agavOnWeightModeEnter();
   agavStartPlantPreload();
+  agavMetricsSetDisplayState(weightMode, currentPanel);
 
   resetWeightState();
   if (!scaleSessionReady) {
@@ -1842,6 +1843,7 @@ static void exitWeightMode() {
   agavOnWeightModeExit();
   calMode = false;
   displayLastActivityMs = millis();
+  agavMetricsSetDisplayState(weightMode, currentPanel);
   Serial.println("weight mode -> 0");
 }
 
@@ -1868,6 +1870,7 @@ void setup() {
   syncTime();
   agavStartPlantPreload();
   agavMetricsStart();
+  agavMetricsSetDisplayState(weightMode, currentPanel);
 
 #if ENABLE_LEGACY_EXTRAS
   // ポーリングは別タスク(core0)で常時実行。メインループ(core1)は止めない。
@@ -1917,6 +1920,7 @@ void loop() {
     } else {
       currentPanel = (currentPanel + 1) % PANEL_COUNT;
       displayPowerNoteActivity(ms);
+      agavMetricsSetDisplayState(weightMode, currentPanel);
       Serial.printf("panel -> %d\n", currentPanel);
     }
     forceDraw = true;

@@ -15,16 +15,26 @@ Core2 の死活とデバイスヘルスを、**15 秒間隔**で Datadog Metrics
 
 `DD_API_KEY` が空のときはタスクを起動しません。
 
-## メトリクス (現在のプレフィックス)
+## メトリクス
 
 | メトリクス | プレフィックス | 型 | 値 | タグ |
 |-----------|----------------|-----|-----|------|
-| `device.running` | `AGAV_METRIC_PREFIX` (`kyouhei.iot`) | gauge | `1` | `device:m5deck`, `version:<git-sha>`, `usb_connected:true/false` |
-| `cpu.user` | `AGAV_CPU_METRIC_PREFIX` (`test.kyouhei.iot`) | gauge | 0-100 (2 コア平均) | 上記 + `num_cores:2` |
-| `memory.pct_usable` | `AGAV_METRIC_PREFIX` | gauge | 0-100 | `device:m5deck`, `version:<git-sha>` |
+| `device.running` | `AGAV_METRIC_PREFIX` (`kyouhei.iot`) | gauge | `1` | `device:m5deck`, `version:<git-sha>`, `usb_connected:true/false`, `panel:digital/analog/weight` |
+| `cpu.user` | `AGAV_METRIC_PREFIX` | gauge | 0-100 (2 コア平均) | 上記 + `num_cores:2` |
+| `memory.pct_usable` | `AGAV_METRIC_PREFIX` | gauge | 0-100 | `device:m5deck`, `version:<git-sha>`, `panel:digital/analog/weight` |
 | `battery.pct` | `AGAV_METRIC_PREFIX` | gauge | 0-100 | 上記 + `usb_connected`, `charging:true/false` |
 
-CPU 検証中は `cpu.user` だけ `test.kyouhei.iot` に残し、他は本番 `kyouhei.iot` です。
+### 表示パネルタグ (`panel`)
+
+`main.cpp` が `agavMetricsSetDisplayState(weightMode, panel)` で更新します。
+
+| 値 | 条件 |
+|----|------|
+| `panel:digital` | デジタル時計 |
+| `panel:analog` | アナログ時計 |
+| `panel:weight` | 重量モード (時計パネル値は無視) |
+
+全 4 メトリクスに付与します。
 
 ### 電源タグ
 
@@ -35,11 +45,11 @@ CPU 検証中は `cpu.user` だけ `test.kyouhei.iot` に残し、他は本番 `
 
 `cpu.user` / `memory.pct_usable` には電源タグを付けません。
 
-例 (テスト中):
+例:
 
 ```
 kyouhei.iot.device.running
-test.kyouhei.iot.cpu.user
+kyouhei.iot.cpu.user
 kyouhei.iot.memory.pct_usable
 kyouhei.iot.battery.pct
 ```
@@ -50,7 +60,6 @@ kyouhei.iot.battery.pct
 
 ```ini
 -DAGAV_METRIC_PREFIX=\"your.prefix\"
--DAGAV_CPU_METRIC_PREFIX=\"your.prefix.cpu-test\"
 ```
 
 再ビルド・書き込み後、Datadog 上は別メトリクス名になります。モニターも合わせて更新してください。
@@ -87,9 +96,8 @@ Linux の `system.cpu.user` と同様、**ホスト全体で 0-100%** です。
 
 ```
 avg(last_1m):kyouhei.iot.device.running{device:m5deck} < 1
+avg(last_15m):kyouhei.iot.cpu.user{device:m5deck} by {panel}
 ```
-
-プレフィックス変更後は `kyouhei.iot.device.running` に読み替えてください。
 
 ## バージョンタグ
 
